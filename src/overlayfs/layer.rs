@@ -148,9 +148,7 @@ impl Layer {
 
         // Delete whiteout char dev with 0/0 device number.
         if let Some(st) = self.lookup_ignore_enoent(ctx, parent, name)? {
-            let major = unsafe { libc::major(st.attr.st_rdev) };
-            let minor = unsafe { libc::minor(st.attr.st_rdev) };
-            if utils::is_chardev(st.attr) && major == 0 && minor == 0 {
+            if utils::is_whiteout(st.attr) {
                 self.fs
                     .unlink(ctx, parent, utils::to_cstring(name)?.as_c_str())?;
             }

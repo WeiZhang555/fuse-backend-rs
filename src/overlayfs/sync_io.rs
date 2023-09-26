@@ -328,11 +328,14 @@ impl FileSystem for OverlayFs {
         add_entry: &mut dyn FnMut(DirEntry) -> Result<usize>,
     ) -> Result<()> {
         debug!("READDIR: inode: {}, handle: {}\n", _inode, handle);
-        self.do_readdir(ctx, handle, size, offset, &mut |dir_entry,
-                                                         _entry|
-         -> Result<usize> {
-            add_entry(dir_entry)
-        })
+        self.do_readdir(
+            ctx,
+            handle,
+            size,
+            offset,
+            false,
+            &mut |dir_entry, _entry| -> Result<usize> { add_entry(dir_entry) },
+        )
     }
 
     fn readdirplus(
@@ -345,11 +348,14 @@ impl FileSystem for OverlayFs {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
     ) -> Result<()> {
         debug!("READDIRPLUS: inode: {}, handle: {}\n", _inode, handle);
-        self.do_readdir(ctx, handle, size, offset, &mut |dir_entry,
-                                                         entry|
-         -> Result<usize> {
-            add_entry(dir_entry, entry)
-        })
+        self.do_readdir(
+            ctx,
+            handle,
+            size,
+            offset,
+            true,
+            &mut |dir_entry, entry| -> Result<usize> { add_entry(dir_entry, entry) },
+        )
     }
 
     fn open(

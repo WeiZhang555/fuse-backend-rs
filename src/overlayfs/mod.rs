@@ -243,23 +243,15 @@ impl OverlayInode {
         Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
-    pub fn count_entries_and_whiteout(&self, ctx: &Context) -> Result<(u64, u64, u64)> {
+    pub fn count_entries_and_whiteout(&self, ctx: &Context) -> Result<(u64, u64)> {
         let mut count = 0;
         let mut whiteouts = 0;
-        let mut opaque = 0;
 
         let st = self.stat64(ctx)?;
 
         // must be directory
         if !utils::is_dir(st) {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
-        }
-
-        // FIXME: should we remove this? @fangcun.zw
-        if let Some(ri) = self.upper_inode.lock().unwrap().as_ref() {
-            if ri.opaque.load(Ordering::Relaxed) {
-                opaque = 1;
-            }
         }
 
         for (_, child) in self.childrens.lock().unwrap().iter() {
@@ -270,7 +262,7 @@ impl OverlayInode {
             }
         }
 
-        Ok((count, whiteouts, opaque))
+        Ok((count, whiteouts))
     }
 
     pub fn open(
@@ -299,6 +291,7 @@ impl OverlayInode {
     }
 
     pub fn first_inode(&self) -> Arc<RealInode> {
+        // It must have either upper inode or one lower inode.
         match self.upper_inode.lock().unwrap().as_ref() {
             Some(v) => Arc::clone(v),
             None => Arc::clone(&self.lower_inodes[0]),
@@ -717,7 +710,7 @@ impl OverlayFs {
 
             if let Some(st) = ui.stat64_ignore_enoent(ctx)? {
                 if !utils::is_dir(st) {
-                    debug!("it's not a directory");
+                    debug!("{} is not a directory", node.path.as_str());
                     // not directory
                     return Ok(());
                 }
@@ -729,7 +722,7 @@ impl OverlayFs {
             // if opaque, stop here
             if ui.opaque.load(Ordering::Relaxed) {
                 node.loaded.store(true, Ordering::Relaxed);
-                debug!("directory is opaque");
+                debug!("directory {} is opaque", node.path.as_str());
                 return Ok(());
             }
         }
@@ -899,6 +892,7 @@ impl OverlayFs {
         handle: u64,
         size: u32,
         offset: u64,
+        is_readdirplus: bool,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
     ) -> Result<()> {
         trace!(
@@ -957,6 +951,9 @@ impl OverlayFs {
                         entry_timeout: self.config.entry_timeout,
                     };
 
+                    if is_readdirplus {
+                        child.lookups.fetch_add(1, Ordering::Relaxed);
+                    }
                     match add_entry(dir_entry, entry) {
                         Ok(0) => break,
                         Ok(l) => {
@@ -1029,7 +1026,10 @@ impl OverlayFs {
             // what about st_ino/mode/dev..
             // FIXME: update st_ino/mode/dev, or query it from layer
             // on fly?
-            *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
+            node.upper_inode
+                .lock()
+                .unwrap()
+                .replace(Arc::clone(&real_inode));
 
             return Ok(());
         } else {
@@ -1311,32 +1311,30 @@ impl OverlayFs {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
 
+        // Find parent Overlay Inode.
         let pnode = self.lookup_node(ctx, parent, "")?;
         if pnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
+        // Find the Overlay Inode for child with <name>.
         let sname = name.to_string_lossy().to_string();
         let node = self.lookup_node(ctx, parent, sname.as_str())?;
         if node.whiteout.load(Ordering::Relaxed) {
+            // already deleted.
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
         if dir {
             self.reload_directory(ctx, Arc::clone(&node))?;
-            let (count, whiteouts, opaque) = node.count_entries_and_whiteout(ctx)?;
-            trace!(
-                "files: {}, whiteouts: {} opaque: {}\n",
-                count,
-                whiteouts,
-                opaque
-            );
+            let (count, whiteouts) = node.count_entries_and_whiteout(ctx)?;
+            trace!("files: {}, whiteouts: {}\n", count, whiteouts);
             if count > 0 {
                 return Err(Error::from_raw_os_error(libc::ENOTEMPTY));
             }
 
             // need to delete whiteouts?
-            if whiteouts + opaque > 0 {
+            if whiteouts > 0 {
                 if node.in_upper_layer() {
                     self.empty_node_directory(ctx, Arc::clone(&node))?;
                 }
@@ -1394,9 +1392,11 @@ impl OverlayFs {
         node.upper_layer_only()
     }
 
+    // Delete everything in the directory only on upper layer, ignore lower layers.
     pub fn empty_node_directory(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<()> {
         let st = node.stat64(ctx)?;
         if !utils::is_dir(st) {
+            // This function can only be called on directories.
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
@@ -1421,6 +1421,7 @@ impl OverlayFs {
             .collect::<Vec<_>>();
 
         for child in iter {
+            // Only care about upper layer, ignore lower layers.
             if child.in_upper_layer() {
                 if child.whiteout.load(Ordering::Relaxed) {
                     layer.delete_whiteout(ctx, real_inode, child.name.as_str())?
@@ -1428,8 +1429,8 @@ impl OverlayFs {
                     let s = child.stat64(ctx)?;
                     let cname = utils::to_cstring(&child.name)?;
                     if utils::is_dir(s) {
-                        let (count, whiteouts, opaque) = child.count_entries_and_whiteout(ctx)?;
-                        if count + whiteouts + opaque > 0 {
+                        let (count, whiteouts) = child.count_entries_and_whiteout(ctx)?;
+                        if count + whiteouts > 0 {
                             self.empty_node_directory(ctx, Arc::clone(&child))?;
                         }
 
@@ -1439,6 +1440,7 @@ impl OverlayFs {
                     }
                 }
 
+                // Keep "{}" for dropping lock.
                 {
                     // delete the child
                     self.inodes.lock().unwrap().remove(&child.inode);
