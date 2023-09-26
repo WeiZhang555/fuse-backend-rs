@@ -133,7 +133,10 @@ impl FileSystem for OverlayFs {
         if let Some(p) = node.parent.lock().unwrap().upgrade() {
             cs.push(p);
         } else {
-            cs.push(Arc::clone(self.root.as_ref().unwrap()));
+            cs.push(Arc::clone(self.root.as_ref().ok_or_else(|| {
+                error!("OPENDIR: root is none");
+                Error::from_raw_os_error(libc::ENOENT)
+            })?));
         };
 
         for (_, child) in node.childrens.lock().unwrap().iter() {
@@ -169,8 +172,10 @@ impl FileSystem for OverlayFs {
         debug!("RELEASEDIR: inode: {}, handle: {}\n", inode, handle);
         {
             if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-                for child in v.childrens.as_ref().unwrap() {
-                    self.forget_one(child.inode, 1);
+                if v.childrens.as_ref().is_some() {
+                    for child in v.childrens.as_ref().unwrap() {
+                        self.forget_one(child.inode, 1);
+                    }
                 }
 
                 self.forget_one(v.node.inode, 1);
@@ -235,8 +240,11 @@ impl FileSystem for OverlayFs {
         // actual work to copy pnode up..
         let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
 
-        assert!(pnode.in_upper_layer());
-        let real_pnode = Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().unwrap());
+        let real_pnode =
+            Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().ok_or_else(|| {
+                error!("MKDIR: parent upper inode is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?);
 
         let real_parent_inode = real_pnode.inode.load(Ordering::Relaxed);
 
@@ -426,7 +434,14 @@ impl FileSystem for OverlayFs {
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let ri = Arc::clone(&rh.real_inode);
             let real_inode = ri.inode.load(Ordering::Relaxed);
-            let l = Arc::clone(&ri.layer.as_ref().unwrap());
+            let l = &ri
+                .layer
+                .as_ref()
+                .and_then(|layer| Some(layer.clone()))
+                .ok_or_else(|| {
+                    error!("RELEASE: real inode layer is none");
+                    Error::from_raw_os_error(libc::EINVAL)
+                })?;
             l.fs().release(
                 ctx,
                 real_inode,
@@ -496,8 +511,7 @@ impl FileSystem for OverlayFs {
         }
 
         let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
-
-        assert!(pnode.upper_inode.lock().unwrap().is_some());
+        //assert!(pnode.upper_inode.lock().unwrap().is_some());
 
         let real_parent_inode = pnode.first_inode().inode.load(Ordering::Relaxed);
 
@@ -505,7 +519,10 @@ impl FileSystem for OverlayFs {
         if is_whiteout {
             let node = Arc::clone(node.as_ref().unwrap());
             let first_inode = node.first_inode();
-            let first_layer = first_inode.layer.as_ref().unwrap();
+            let first_layer = first_inode.layer.as_ref().ok_or_else(|| {
+                error!("CREATE: first inode layer is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?;
             if node.in_upper_layer() {
                 // whiteout in upper layer, need to delete
                 first_layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
@@ -533,7 +550,11 @@ impl FileSystem for OverlayFs {
         let node = self.lookup_node(ctx, parent, sname.as_str())?;
         pnode.loaded.store(true, Ordering::Relaxed);
 
-        let real_inode = Arc::clone(node.upper_inode.lock().unwrap().as_ref().unwrap());
+        let real_inode =
+            Arc::clone(node.upper_inode.lock().unwrap().as_ref().ok_or_else(|| {
+                error!("CREATE: node {}'s upper inode is none", node.inode);
+                Error::from_raw_os_error(libc::EINVAL)
+            })?);
 
         let final_handle = if let Some(hd) = h {
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -598,7 +619,10 @@ impl FileSystem for OverlayFs {
                 let ri = Arc::clone(&hd.real_inode);
                 let (real_inode, layer) = (
                     ri.inode.load(Ordering::Relaxed),
-                    Arc::clone(ri.layer.as_ref().unwrap()),
+                    Arc::clone(ri.layer.as_ref().ok_or_else(|| {
+                        error!("READ: real inode layer is none");
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?),
                 );
 
                 return layer.fs().read(
@@ -647,7 +671,10 @@ impl FileSystem for OverlayFs {
                 let ri = Arc::clone(&hd.real_inode);
                 let (real_inode, layer) = (
                     ri.inode.load(Ordering::Relaxed),
-                    Arc::clone(ri.layer.as_ref().unwrap()),
+                    Arc::clone(ri.layer.as_ref().ok_or_else(|| {
+                        error!("WRITE: real inode layer is none");
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?),
                 );
 
                 return layer.fs().write(
@@ -680,7 +707,10 @@ impl FileSystem for OverlayFs {
             if let Some(hd) = self.handles.lock().unwrap().get(&h) {
                 if let Some(ref v) = hd.real_handle {
                     let ri = Arc::clone(&v.real_inode);
-                    let layer = Arc::clone(ri.layer.as_ref().unwrap());
+                    let layer = Arc::clone(ri.layer.as_ref().ok_or_else(|| {
+                        error!("GETATTR: real inode layer is none");
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?);
                     let real_inode = ri.inode.load(Ordering::Relaxed);
                     let real_handle = v.handle.load(Ordering::Relaxed);
                     let (st, _d) = layer.fs().getattr(ctx, real_inode, Some(real_handle))?;
@@ -719,7 +749,10 @@ impl FileSystem for OverlayFs {
             if let Some(hd) = self.handles.lock().unwrap().get(&h) {
                 if let Some(ref rhd) = hd.real_handle {
                     let ri = Arc::clone(&rhd.real_inode);
-                    let layer = Arc::clone(ri.layer.as_ref().unwrap());
+                    let layer = Arc::clone(ri.layer.as_ref().ok_or_else(|| {
+                        error!("SETATTR: real inode layer is none");
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?);
                     let real_inode = ri.inode.load(Ordering::Relaxed);
                     let real_handle = rhd.handle.load(Ordering::Relaxed);
                     // handle opened in upper layer
@@ -746,7 +779,10 @@ impl FileSystem for OverlayFs {
 
         let v = node.first_inode();
         let (layer, real_inode) = (
-            Arc::clone(v.layer.as_ref().unwrap()),
+            Arc::clone(v.layer.as_ref().ok_or_else(|| {
+                error!("SETATTR: real inode layer is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?),
             v.inode.load(Ordering::Relaxed),
         );
 
@@ -806,15 +842,19 @@ impl FileSystem for OverlayFs {
 
         let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
 
-        assert!(pnode.upper_inode.lock().unwrap().is_some());
-
         let real_parent_inode = pnode.first_inode().inode.load(Ordering::Relaxed);
 
         // need to delete whiteout?
         if is_whiteout {
-            let node = Arc::clone(node.as_ref().unwrap());
+            let node = Arc::clone(node.as_ref().ok_or_else(|| {
+                error!("MKNOD: node is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?);
             let first_inode = node.first_inode();
-            let first_layer = first_inode.layer.as_ref().unwrap();
+            let first_layer = first_inode.layer.as_ref().ok_or_else(|| {
+                error!("MKNOD: first inode layer is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?;
             if node.in_upper_layer() {
                 // whiteout in upper layer, need to delete
                 first_layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
@@ -826,11 +866,18 @@ impl FileSystem for OverlayFs {
         }
 
         // make it
-        assert!(pnode.in_upper_layer());
+        //assert!(pnode.in_upper_layer());
 
-        let real_inode = Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().unwrap());
-        let layer = Arc::clone(real_inode.layer.as_ref().unwrap());
-        let _entry = layer
+        let real_inode =
+            Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().ok_or_else(|| {
+                error!("MKNOD: parent upper inode is none");
+                Error::from_raw_os_error(libc::EINVAL)
+            })?);
+        let layer = Arc::clone(real_inode.layer.as_ref().ok_or_else(|| {
+            error!("MKNOD: real inode layer is none");
+            Error::from_raw_os_error(libc::EINVAL)
+        })?);
+        layer
             .fs()
             .mknod(ctx, real_parent_inode, name, mode, rdev, umask)?;
 
@@ -877,7 +924,10 @@ impl FileSystem for OverlayFs {
             if self.node_in_upper_layer(Arc::clone(&n))? {
                 // find out the real parent inode and delete whiteout
                 let pri = newpnode.first_inode();
-                let layer = Arc::clone(pri.layer.as_ref().unwrap());
+                let layer = Arc::clone(pri.layer.as_ref().ok_or_else(|| {
+                    error!("LINK: parent first inode layer is none");
+                    Error::from_raw_os_error(libc::EINVAL)
+                })?);
                 let real_parent_inode = pri.inode.load(Ordering::Relaxed);
                 layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
             }
@@ -889,7 +939,10 @@ impl FileSystem for OverlayFs {
 
         // create the link
         let pri = newpnode.first_inode();
-        let layer = Arc::clone(pri.layer.as_ref().unwrap());
+        let layer = Arc::clone(pri.layer.as_ref().ok_or_else(|| {
+            error!("LINK: parent first inode layer is none");
+            Error::from_raw_os_error(libc::EINVAL)
+        })?);
         let real_parent_inode = pri.inode.load(Ordering::Relaxed);
         let real_inode = node.first_inode().inode.load(Ordering::Relaxed);
         layer.fs().link(ctx, real_inode, real_parent_inode, name)?;
@@ -936,7 +989,10 @@ impl FileSystem for OverlayFs {
         let (layer, real_parent) = {
             let first = pnode.first_inode();
             (
-                Arc::clone(first.layer.as_ref().unwrap()),
+                Arc::clone(first.layer.as_ref().ok_or_else(|| {
+                    error!("SYMLINK: parent first inode layer is none");
+                    Error::from_raw_os_error(libc::EINVAL)
+                })?),
                 first.inode.load(Ordering::Relaxed),
             )
         };
@@ -962,7 +1018,10 @@ impl FileSystem for OverlayFs {
         let (layer, real_inode) = {
             let first = node.first_inode();
             (
-                Arc::clone(first.layer.as_ref().unwrap()),
+                Arc::clone(first.layer.as_ref().ok_or_else(|| {
+                    error!("READLINK: first inode layer is none");
+                    Error::from_raw_os_error(libc::EINVAL)
+                })?),
                 first.inode.load(Ordering::Relaxed),
             )
         };
