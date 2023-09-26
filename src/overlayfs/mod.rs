@@ -87,8 +87,7 @@ pub struct OverlayInode {
     pub entry_type: u32,
     pub path: String,
     pub name: String,
-    pub lookups: Mutex<u64>,
-
+    pub lookups: AtomicU64,
     pub hidden: AtomicBool,
     // Node is whiteout-ed.
     pub whiteout: AtomicBool,
@@ -356,7 +355,7 @@ impl OverlayFs {
         root.path = String::from("");
         root.name = String::from("");
         root.entry_type = libc::DT_DIR as u32;
-        root.lookups = Mutex::new(2);
+        root.lookups = AtomicU64::new(2);
         let ctx = Context::default();
 
         // Update upper inode
@@ -421,7 +420,7 @@ impl OverlayFs {
             invalid: AtomicBool::new(false),
         });
 
-        new.lookups = Mutex::new(1);
+        new.lookups = AtomicU64::new(1);
         if layer.is_upper() {
             new.upper_inode = Mutex::new(Some(Arc::clone(&real_inode)));
         }
@@ -817,17 +816,18 @@ impl OverlayFs {
             }
         };
         // lock up lookups
-        let mut lookups = v.lookups.lock().unwrap();
+        let mut lookups = v.lookups.load(Ordering::Relaxed);
 
-        if *lookups < count {
-            *lookups = 0;
+        if lookups < count {
+            lookups = 0;
         } else {
-            *lookups -= count;
+            lookups -= count;
         }
+        v.lookups.store(lookups, Ordering::Relaxed);
 
         // remove it from hashmap
 
-        if *lookups == 0 {
+        if lookups == 0 {
             let _ = self.inode_remove(inode);
             let parent = v.parent.lock().unwrap();
 
@@ -841,18 +841,41 @@ impl OverlayFs {
     }
 
     pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
-        if let Some(v) = self.get_first_layer() {
-            if let Ok(sfs) = v.fs().statfs(ctx, inode) {
+        if let Some(ovl) = self.inode_get(inode) {
+            // Find upper layer.
+            let real_inode = ovl
+                .upper_inode
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|ri| Some(ri.clone()))
+                .or_else(|| {
+                    if ovl.lower_inodes.len() > 0 {
+                        Some(Arc::clone(&ovl.lower_inodes[0]))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| Error::new(ErrorKind::Other, "backend inode not found"))?;
+
+            let layer = real_inode
+                .layer
+                .as_ref()
+                .ok_or_else(|| Error::new(ErrorKind::Other, "layer not found for real inode"))?;
+            if let Ok(sfs) = layer
+                .fs()
+                .statfs(ctx, real_inode.inode.load(Ordering::Relaxed))
+            {
                 return Ok(sfs);
             }
         }
-
         // otherwise stat on mountpoint
         let mut sfs = MaybeUninit::<libc::statvfs64>::zeroed();
         // FIXME: mountpoint may not exists at all. @fangcun.zw
         let cpath = utils::to_cstring(self.config.mountpoint.as_str())?;
         let path = cpath.as_c_str().as_ptr();
 
+        debug!("stat mountpoint path: {}", cpath.to_str().unwrap());
         match unsafe { libc::statvfs64(path, sfs.as_mut_ptr()) } {
             0 => {
                 let sfs = unsafe { sfs.assume_init() };

@@ -69,7 +69,9 @@ impl FileSystem for OverlayFs {
 
     fn statfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
         debug!("STATFS: inode: {}\n", inode);
-        self.do_statvfs(ctx, inode)
+        let result = self.do_statvfs(ctx, inode);
+        debug!("STATFS: inode: {} === done\n", inode);
+        return result;
     }
 
     fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<Entry> {
@@ -99,7 +101,7 @@ impl FileSystem for OverlayFs {
 
         // FIXME: can forget happen between found and increase reference counter?
 
-        *node.lookups.lock().unwrap() += 1;
+        node.lookups.fetch_add(1, Ordering::Relaxed);
 
         Ok(Entry {
             inode: node.inode as u64,
@@ -178,10 +180,10 @@ impl FileSystem for OverlayFs {
         }
 
         for c in cs.iter() {
-            *c.lookups.lock().unwrap() += 1;
+            c.lookups.fetch_add(1, Ordering::Relaxed);
         }
 
-        *node.lookups.lock().unwrap() += 1;
+        node.lookups.fetch_add(1, Ordering::Relaxed);
 
         self.handles.lock().unwrap().insert(
             handle,
