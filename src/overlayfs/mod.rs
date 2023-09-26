@@ -669,13 +669,20 @@ impl OverlayFs {
                         offset = d.offset;
                         let child_name = String::from_utf8_lossy(d.name).into_owned();
 
-                        debug!("entry: {}", child_name.as_str());
+                        trace!("entry: {}", child_name.as_str());
 
                         if child_name.eq(CURRENT_DIR) || child_name.eq(PARENT_DIR) {
                             return Ok(1);
                         }
 
-                        self.lookup_node(ctx, ovl_inode, child_name.as_str())?;
+                        if let Err(e) = self.lookup_node(ctx, ovl_inode, child_name.as_str()) {
+                            error!(
+                                "lookup node name {} under parent {} failed: {}",
+                                child_name.as_str(),
+                                ovl_inode,
+                                e
+                            );
+                        }
 
                         Ok(1)
                     },
@@ -821,6 +828,7 @@ impl OverlayFs {
         // remove it from hashmap
 
         if lookups == 0 {
+            debug!("inode is forgotten: {}, name {}", inode, v.name);
             let _ = self.inode_remove(inode);
             let parent = v.parent.lock().unwrap();
 

@@ -179,6 +179,7 @@ impl FileSystem for OverlayFs {
             cs.push(Arc::clone(child));
         }
 
+        // TODO: is this necessary to increase lookup count?
         for c in cs.iter() {
             c.lookups.fetch_add(1, Ordering::Relaxed);
         }
@@ -879,6 +880,9 @@ impl FileSystem for OverlayFs {
         pnode.loaded.store(false, Ordering::Relaxed);
         let node = self.lookup_node(ctx, parent, sname.as_str())?;
         pnode.loaded.store(true, Ordering::Relaxed);
+
+        node.lookups.fetch_add(1, Ordering::Relaxed);
+
         Ok(Entry {
             inode: node.inode,
             generation: 0,
@@ -1002,6 +1006,7 @@ impl FileSystem for OverlayFs {
         let node = self.lookup_node(ctx, parent, sname.as_str())?;
         pnode.loaded.store(true, Ordering::Relaxed);
 
+        node.lookups.fetch_add(1, Ordering::Relaxed);
         Ok(Entry {
             inode: node.inode,
             generation: 0,
