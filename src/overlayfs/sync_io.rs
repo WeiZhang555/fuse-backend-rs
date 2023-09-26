@@ -70,7 +70,6 @@ impl FileSystem for OverlayFs {
     fn statfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
         debug!("STATFS: inode: {}\n", inode);
         let result = self.do_statvfs(ctx, inode);
-        debug!("STATFS: inode: {} === done\n", inode);
         return result;
     }
 
@@ -590,6 +589,7 @@ impl FileSystem for OverlayFs {
         };
 
         // return data
+        node.lookups.fetch_add(1, Ordering::Relaxed);
         let entry = Entry {
             inode: node.inode,
             generation: 0,
