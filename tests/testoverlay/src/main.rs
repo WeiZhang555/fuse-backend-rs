@@ -6,9 +6,11 @@ extern crate signal_hook;
 extern crate simple_logger;
 extern crate vmm_sys_util;
 
-use std::io::Result;
+use std::env;
+use std::io::{Error, Result};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 use fuse_backend_rs::api::server::Server;
 //use fuse_backend_rs::api::{Vfs, VfsOptions};
@@ -19,7 +21,15 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::LevelFilter;
 use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use simple_logger::SimpleLogger;
-use std::thread;
+
+#[derive(Debug, Default)]
+pub struct Args {
+    name: String,
+    mountpoint: String,
+    lowerdir: Vec<String>,
+    upperdir: String,
+    workdir: String,
+}
 
 pub struct FuseServer {
     server: Arc<Server<Arc<OverlayFs>>>,
@@ -37,54 +47,97 @@ fn new_passthroughfs_layer(rootdir: &str, is_upper: bool) -> Result<Layer> {
     Ok(Layer::new(fs, is_upper))
 }
 
+fn help() {
+    println!(
+        "Usage:\n   testoverlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint>\n"
+    );
+}
+
+fn parse_args() -> Result<Args> {
+    let args = env::args().collect::<Vec<String>>();
+    if args.len() < 5 {
+        help();
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+
+    if args[1].as_str() != "-o" {
+        help();
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+
+    let mut cmd_args = Args {
+        name: args[3].clone(),
+        mountpoint: args[4].clone(),
+        ..Default::default()
+    };
+    let option = args[2].clone();
+    // Parse option.
+    option.split(",").try_for_each(|value| -> Result<()> {
+        let kv = value.split("=").collect::<Vec<&str>>();
+        if kv.len() != 2 {
+            println!("invalid option: {}", value);
+            help();
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        match kv[0] {
+            "lowerdir" => {
+                cmd_args.lowerdir = kv[1]
+                    .split(":")
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>();
+            }
+            "upperdir" => {
+                cmd_args.upperdir = kv[1].to_string();
+            }
+            "workdir" => {
+                cmd_args.workdir = kv[1].to_string();
+            }
+            _ => {
+                println!("invalid option: {}", kv[0]);
+                help();
+                return Err(Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+        Ok(())
+    })?;
+
+    // All fields should be set.
+    if cmd_args.lowerdir.is_empty() || cmd_args.upperdir.is_empty() || cmd_args.workdir.is_empty() {
+        println!("lowerdir, upperdir and workdir should be set");
+        help();
+        return Err(Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(cmd_args)
+}
+
 fn main() -> Result<()> {
     SimpleLogger::new()
         .with_level(LevelFilter::Debug)
         .init()
         .unwrap();
-    let basedir = "/home/zhangwei/program/test-overlay/test2/";
-    let upper_layer = Arc::new(Box::new(new_passthroughfs_layer(
-        format!("{}up", basedir).as_str(),
-        true,
-    )?));
-    let mut lower_layers = Vec::new();
-    lower_layers.push(Arc::new(Box::new(new_passthroughfs_layer(
-        format!("{}3", basedir).as_str(),
-        false,
-    )?)));
-    lower_layers.push(Arc::new(Box::new(new_passthroughfs_layer(
-        format!("{}2", basedir).as_str(),
-        false,
-    )?)));
-    lower_layers.push(Arc::new(Box::new(new_passthroughfs_layer(
-        format!("{}1", basedir).as_str(),
-        false,
-    )?)));
+    let args = parse_args()?;
+    println!("args: {:?}", args);
 
-    let workdir = format!("{}work", basedir);
-    let mountpoint = format!("{}merged", basedir);
+    // let basedir = "/home/zhangwei/program/test-overlay/test2/";
+    let upper_layer = Arc::new(Box::new(new_passthroughfs_layer(&args.upperdir, true)?));
+    let mut lower_layers = Vec::new();
+    for lower in args.lowerdir {
+        lower_layers.push(Arc::new(Box::new(new_passthroughfs_layer(&lower, false)?)));
+    }
 
     let mut config = Config::default();
-    config.work = workdir;
-    config.mountpoint = String::from(mountpoint.as_str());
+    config.work = args.workdir.clone();
+    config.mountpoint = args.mountpoint.clone();
     config.do_import = true;
 
     print!("new overlay fs\n");
     let mut fs = OverlayFs::new(Some(upper_layer), lower_layers, config)?;
-    //let mut fs = OverlayFs::new(None, lower_layers, config)?;
     print!("init root inode\n");
     fs.init_root()?;
 
-    // let vfs = Vfs::new(VfsOptions {
-    //	no_open: false,
-    //	no_opendir: false,
-    //	..Default::default()
-    // });
-
-    // vfs.mount(Box::new(fs), "/")?;
     print!("open fuse session\n");
-    let mut se =
-        FuseSession::new(Path::new(mountpoint.as_str()), "testoverlay", "", false).unwrap();
+    let mut se = FuseSession::new(Path::new(&args.mountpoint), &args.name, "", false).unwrap();
     print!("session opened\n");
     se.mount().unwrap();
 
@@ -93,9 +146,6 @@ fn main() -> Result<()> {
         ch: se.new_channel().unwrap(),
     };
 
-    // let quit = Arc::new(Mutex::new(false));
-    // let quit1 = Arc::clone(&quit);
-
     let handle = thread::spawn(move || {
         let _ = server.svc_loop();
     });
@@ -103,7 +153,6 @@ fn main() -> Result<()> {
     // main thread
     let mut signals = Signals::new(TERM_SIGNALS).unwrap();
     for _sig in signals.forever() {
-        // *quit.lock().unwrap() = true;
         break;
     }
 

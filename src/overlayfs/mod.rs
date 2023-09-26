@@ -1,5 +1,4 @@
 #![allow(missing_docs)]
-//#![feature(io_error_more)]
 
 pub mod config;
 pub mod layer;
