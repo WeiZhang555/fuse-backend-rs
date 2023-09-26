@@ -745,27 +745,26 @@ impl OverlayFs {
 
             if let Some(st) = ri.stat64_ignore_enoent(ctx)? {
                 if !utils::is_dir(st) {
+                    debug!("{} is not a directory", node.path.as_str());
                     // not directory
                     break 'layer_loop;
                 }
 
                 // process this layer
-                match self.load_directory_layer(ctx, node.inode, Arc::clone(ri)) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if let Some(raw_error) = e.raw_os_error() {
-                            if raw_error == libc::ENOENT {
-                                continue 'layer_loop;
-                            }
+                if let Err(e) = self.load_directory_layer(ctx, node.inode, Arc::clone(ri)) {
+                    if let Some(raw_error) = e.raw_os_error() {
+                        if raw_error == libc::ENOENT {
+                            continue 'layer_loop;
                         }
-
-                        return Err(e);
                     }
+
+                    return Err(e);
                 }
             }
 
             // if opaque, stop here
             if ri.opaque.load(Ordering::Relaxed) {
+                debug!("directory {} is opaque", node.path.as_str());
                 break 'layer_loop;
             }
         }
@@ -841,6 +840,38 @@ impl OverlayFs {
         // FIXME: is it possible that the inode still in childrens map?
     }
 
+    pub fn do_lookup(&self, ctx: &Context, parent: Inode, name: &str) -> Result<Entry> {
+        let node = self.lookup_node(ctx, parent, name)?;
+
+        if node.whiteout.load(Ordering::Relaxed) {
+            return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if let None = self.get_node_from_inode(parent) {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        };
+
+        let st = node.stat64(ctx)?;
+
+        // load this directory here
+        if utils::is_dir(st) {
+            self.load_directory(ctx, Arc::clone(&node))?;
+            node.loaded.store(true, Ordering::Relaxed);
+        }
+
+        // FIXME: can forget happen between found and increase reference counter?
+        node.lookups.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Entry {
+            inode: node.inode as u64,
+            generation: 0,
+            attr: st, //libc::stat64
+            attr_flags: 0,
+            attr_timeout: self.config.attr_timeout,
+            entry_timeout: self.config.entry_timeout,
+        })
+    }
+
     pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
         if let Some(ovl) = self.inode_get(inode) {
             // Find upper layer.
@@ -901,7 +932,7 @@ impl OverlayFs {
         size: u32,
         offset: u64,
         is_readdirplus: bool,
-        add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
+        add_entry: &mut dyn FnMut(DirEntry, Option<Entry>) -> Result<usize>,
     ) -> Result<()> {
         trace!(
             "do_reddir: handle: {}, size: {}, offset: {}",
@@ -950,18 +981,19 @@ impl OverlayFs {
                         name: name.as_bytes(),
                     };
 
-                    let entry = Entry {
-                        inode: child.inode,
-                        generation: 0,
-                        attr: st,
-                        attr_flags: 0,
-                        attr_timeout: self.config.attr_timeout,
-                        entry_timeout: self.config.entry_timeout,
-                    };
-
-                    if is_readdirplus {
+                    let entry = if is_readdirplus {
                         child.lookups.fetch_add(1, Ordering::Relaxed);
-                    }
+                        Some(Entry {
+                            inode: child.inode,
+                            generation: 0,
+                            attr: st,
+                            attr_flags: 0,
+                            attr_timeout: self.config.attr_timeout,
+                            entry_timeout: self.config.entry_timeout,
+                        })
+                    } else {
+                        None
+                    };
                     match add_entry(dir_entry, entry) {
                         Ok(0) => break,
                         Ok(l) => {
@@ -1315,6 +1347,7 @@ impl OverlayFs {
     }
 
     pub fn do_rm(&self, ctx: &Context, parent: u64, name: &CStr, dir: bool) -> Result<()> {
+        // FIXME: should we defer removal after lookup count decreased to zero? @fangcun.zw
         if self.upper_layer.is_none() {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }

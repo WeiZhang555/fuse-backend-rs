@@ -76,40 +76,7 @@ impl FileSystem for OverlayFs {
     fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<Entry> {
         let tmp = name.to_string_lossy().to_string();
         debug!("LOOKUP: parent: {}, name: {}\n", parent, tmp);
-        let node = self.lookup_node(ctx, parent, tmp.as_str())?;
-
-        if node.whiteout.load(Ordering::Relaxed) {
-            return Err(Error::from_raw_os_error(libc::ENOENT));
-        }
-
-        let pnode = if let Some(v) = self.get_node_from_inode(parent) {
-            v
-        } else {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        };
-
-        let _ppath = String::from(pnode.path.as_str());
-        let _sname = name.to_string_lossy().into_owned().to_owned();
-        let st = node.stat64(ctx)?;
-
-        // load this directory here
-        if utils::is_dir(st) {
-            self.load_directory(ctx, Arc::clone(&node))?;
-            node.loaded.store(true, Ordering::Relaxed);
-        }
-
-        // FIXME: can forget happen between found and increase reference counter?
-
-        node.lookups.fetch_add(1, Ordering::Relaxed);
-
-        Ok(Entry {
-            inode: node.inode as u64,
-            generation: 0,
-            attr: st, //libc::stat64
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        })
+        self.do_lookup(ctx, parent, tmp.as_str())
     }
 
     fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
@@ -220,7 +187,7 @@ impl FileSystem for OverlayFs {
     // for mkdir or create file
     // 1. lookup name, if exists and not whiteout, return EEXIST
     // 2. not exists and no whiteout, copy up parent node, ususally  a mkdir on upper layer would do the work
-    // 3. find whiteout, if whiteout in upper layer, shoudl set opaque. if in lower layer, just mkdir?
+    // 3. find whiteout, if whiteout in upper layer, should set opaque. if in lower layer, just mkdir?
     fn mkdir(
         &self,
         ctx: &Context,
@@ -295,18 +262,11 @@ impl FileSystem for OverlayFs {
             self.inodes.lock().unwrap().remove(&node.inode);
         }
 
-        let node = self.lookup_node(ctx, parent, sname.as_str())?;
+        let entry = self.do_lookup(ctx, parent, sname.as_str());
 
         pnode.loaded.store(true, Ordering::Relaxed);
 
-        Ok(Entry {
-            inode: node.inode,
-            generation: 0,
-            attr: node.stat64(ctx)?,
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        })
+        entry
     }
 
     fn rmdir(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<()> {
@@ -334,7 +294,7 @@ impl FileSystem for OverlayFs {
             size,
             offset,
             false,
-            &mut |dir_entry, _entry| -> Result<usize> { add_entry(dir_entry) },
+            &mut |dir_entry, _| -> Result<usize> { add_entry(dir_entry) },
         )
     }
 
@@ -354,7 +314,12 @@ impl FileSystem for OverlayFs {
             size,
             offset,
             true,
-            &mut |dir_entry, entry| -> Result<usize> { add_entry(dir_entry, entry) },
+            &mut |dir_entry, entry| -> Result<usize> {
+                match entry {
+                    Some(e) => add_entry(dir_entry, e),
+                    None => Err(Error::from_raw_os_error(libc::ENOENT)),
+                }
+            },
         )
     }
 
@@ -589,15 +554,7 @@ impl FileSystem for OverlayFs {
         };
 
         // return data
-        node.lookups.fetch_add(1, Ordering::Relaxed);
-        let entry = Entry {
-            inode: node.inode,
-            generation: 0,
-            attr: node.stat64(ctx)?,
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        };
+        let entry = self.do_lookup(ctx, parent, sname.as_str())?;
 
         let mut opts = OpenOptions::empty();
         match self.config.cache_policy {
@@ -878,19 +835,10 @@ impl FileSystem for OverlayFs {
             .mknod(ctx, real_parent_inode, name, mode, rdev, umask)?;
 
         pnode.loaded.store(false, Ordering::Relaxed);
-        let node = self.lookup_node(ctx, parent, sname.as_str())?;
+        let entry = self.do_lookup(ctx, parent, sname.as_str());
         pnode.loaded.store(true, Ordering::Relaxed);
 
-        node.lookups.fetch_add(1, Ordering::Relaxed);
-
-        Ok(Entry {
-            inode: node.inode,
-            generation: 0,
-            attr: node.stat64(ctx)?,
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        })
+        entry
     }
 
     fn link(&self, ctx: &Context, inode: Inode, newparent: Inode, name: &CStr) -> Result<Entry> {
@@ -947,17 +895,10 @@ impl FileSystem for OverlayFs {
         layer.fs().link(ctx, real_inode, real_parent_inode, name)?;
 
         newpnode.loaded.store(false, Ordering::Relaxed);
-        let node = self.lookup_node(ctx, newparent, sname.as_str())?;
+        let entry = self.do_lookup(ctx, newparent, sname.as_str());
         newpnode.loaded.store(true, Ordering::Relaxed);
 
-        Ok(Entry {
-            inode: node.inode,
-            generation: 0,
-            attr: node.stat64(ctx)?,
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        })
+        entry
     }
 
     fn symlink(&self, ctx: &Context, linkname: &CStr, parent: Inode, name: &CStr) -> Result<Entry> {
@@ -1003,18 +944,9 @@ impl FileSystem for OverlayFs {
         layer.fs().symlink(ctx, linkname, real_parent, name)?;
 
         pnode.loaded.store(false, Ordering::Relaxed);
-        let node = self.lookup_node(ctx, parent, sname.as_str())?;
+        let entry = self.do_lookup(ctx, parent, sname.as_str());
         pnode.loaded.store(true, Ordering::Relaxed);
-
-        node.lookups.fetch_add(1, Ordering::Relaxed);
-        Ok(Entry {
-            inode: node.inode,
-            generation: 0,
-            attr: node.stat64(ctx)?,
-            attr_flags: 0,
-            attr_timeout: self.config.attr_timeout,
-            entry_timeout: self.config.entry_timeout,
-        })
+        entry
     }
 
     fn readlink(&self, ctx: &Context, inode: Inode) -> Result<Vec<u8>> {
