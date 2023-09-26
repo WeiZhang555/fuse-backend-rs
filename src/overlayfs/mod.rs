@@ -4,10 +4,10 @@
 pub mod config;
 pub mod direct;
 pub mod layer;
-pub mod plugin;
 pub mod sync_io;
+mod utils;
 
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Result, Seek, SeekFrom};
@@ -27,14 +27,12 @@ use crate::common::file_traits::FileReadWriteVolatile;
 
 use self::config::Config;
 use self::layer::Layer;
-use self::plugin::PluginManager;
 use libc;
 use std::io::{Error, ErrorKind};
 
 pub type Inode = u64;
 pub type Handle = u64;
 pub const PLUGIN_PREFIX: &str = "//";
-pub const WHITEOUT_PREFIX: &str = ".wh.";
 pub const XATTR_PREFIX: &str = "user.fuseoverlayfs";
 pub const ORIGIN_XATTR: &str = "user.fuseoverlayfs.origin";
 pub const OPAQUE_XATTR: &str = "user.fuseoverlayfs.opaque";
@@ -44,22 +42,21 @@ pub const UNPRIVILEGED_OPAQUE_XATTR: &str = "user.overlay.opaque";
 pub const PRIVILEGED_XATTR_PREFIX: &str = "trusted.overlay";
 pub const PRIVILEGED_OPAQUE_XATTR: &str = "trusted.overlay.opaque";
 pub const PRIVILEGED_ORIGIN_XATTR: &str = "trusted.overlay.origin";
-pub const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 pub const MAXNAMELEN: usize = 256;
 pub const CURRENT_DIR: &str = ".";
 pub const PARENT_DIR: &str = "..";
-pub const WHITEOUT_MAX_LEN: u64 = ".wh.".len() as u64;
 pub const MAXBUFSIZE: usize = 1 << 20;
-
-pub type BoxedLayer = Box<dyn Layer<Inode = Inode, Handle = Handle> + Send + Sync>;
 
 // need real inode from layers, need inode to do layer
 // operations
 #[derive(Default)]
 pub struct RealInode {
-    pub layer: Option<Arc<BoxedLayer>>,
+    // TODO: make this required field. @fangcun.zw
+    pub layer: Option<Arc<Box<Layer>>>,
     pub inode: AtomicU64,
+    // File is whiteouted, we need to hide it.
     pub whiteout: AtomicBool,
+    // Directory is opaque, we need to hide all entries inside it.
     pub opaque: AtomicBool,
     pub hidden: AtomicBool,
     pub invalid: AtomicBool,
@@ -71,18 +68,18 @@ pub struct RealInodeStats {
     pub whiteout: bool,
     pub opaque: bool,
     pub stat: Option<libc::stat64>,
-    pub wh_name: Option<String>,
-    pub opaque_inode: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct OverlayInode {
+    // Inode hash table, map from 'name' to 'OverlayInode'.
     pub childrens: Mutex<HashMap<String, Arc<OverlayInode>>>,
     pub parent: Mutex<Weak<OverlayInode>>,
+    // Backend inodes from all low layers.
     pub lower_inodes: Vec<Arc<RealInode>>,
+    // Backend inode from upper layer.
     pub upper_inode: Mutex<Option<Arc<RealInode>>>,
-    pub first_inode: Mutex<Arc<RealInode>>,
-    pub last_inode: Mutex<Arc<RealInode>>,
+    // Inode number.
     pub inode: u64,
     pub st_ino: libc::ino64_t,
     pub st_dev: libc::dev_t,
@@ -93,6 +90,7 @@ pub struct OverlayInode {
     pub lookups: Mutex<u64>,
 
     pub hidden: AtomicBool,
+    // Node is whiteout-ed.
     pub whiteout: AtomicBool,
     pub loaded: AtomicBool,
     // what about data source related data for each inode
@@ -108,8 +106,8 @@ pub enum CachePolicy {
 pub struct OverlayFs {
     // should be in daemon structure
     pub config: Config,
-    pub layers: LinkedList<Arc<BoxedLayer>>,
-    pub upper_layer: Option<Arc<BoxedLayer>>,
+    pub lower_layers: Vec<Arc<Box<Layer>>>,
+    pub upper_layer: Option<Arc<Box<Layer>>>,
     // inode management..
     pub root: Option<Arc<OverlayInode>>,
     pub inodes: Mutex<HashMap<u64, Arc<OverlayInode>>>,
@@ -146,10 +144,10 @@ impl RealInode {
             return Ok(None);
         }
 
-        match self
-            .layer
-            .as_ref()
-            .unwrap()
+        let layer = self.layer.as_ref();
+        match layer
+            .ok_or(Error::from_raw_os_error(libc::EINVAL))?
+            .fs()
             .getattr(ctx, self.inode.load(Ordering::Relaxed), None)
         {
             Ok((v1, _v2)) => {
@@ -174,60 +172,54 @@ impl RealInode {
         }
     }
 
-    // Ok(None) represents noent
-    pub fn lookup_node(&self, ctx: &Context, name: &CStr) -> Result<Option<RealInodeStats>> {
+    // Find child real-inode under this directory(Self).
+    // Return None if not found.
+    pub fn lookup_node(&self, ctx: &Context, name: &str) -> Result<Option<RealInodeStats>> {
         if self.whiteout.load(Ordering::Relaxed) || self.invalid.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
-        let sname = name.to_string_lossy().into_owned().to_owned();
-        if sname.starts_with(WHITEOUT_PREFIX) {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
+        let layer = self
+            .layer
+            .as_ref()
+            .ok_or(Error::from_raw_os_error(libc::EINVAL))?;
+        let inode = self.inode.load(Ordering::Relaxed);
+        let whiteout = layer.is_whiteout(ctx, inode)?;
 
-        let layer = self.layer.as_ref().unwrap();
-
-        let (whiteout, inode, wh_name) =
-            layer.whiteout_exists(ctx, self.inode.load(Ordering::Relaxed), name)?;
-
+        // The inode is whiteout-ed, return directly.
         if whiteout {
             return Ok(Some(RealInodeStats {
                 inode,
                 whiteout,
                 opaque: false,
                 stat: None,
-                wh_name: Some(wh_name),
-                opaque_inode: None,
             }));
         }
 
-        if let Some(v) =
-            layer.lookup_ignore_enoent(ctx, self.inode.load(Ordering::Relaxed), sname.as_str())?
-        {
-            // directory?
-            if v.attr.st_mode & libc::S_IFMT != libc::S_IFDIR {
-                return Ok(Some(RealInodeStats {
+        // Find Entry with <name> under directory with inode <self.inode>.
+        match layer.lookup_ignore_enoent(ctx, self.inode.load(Ordering::Relaxed), name)? {
+            Some(v) => {
+                // Not directory.
+                if !utils::is_dir(v.attr) {
+                    return Ok(Some(RealInodeStats {
+                        inode: v.inode,
+                        // Check if it's whiteouted.
+                        whiteout: layer.is_whiteout(ctx, v.inode)?,
+                        opaque: false,
+                        stat: Some(v.attr),
+                    }));
+                }
+
+                // For directory.
+                Ok(Some(RealInodeStats {
                     inode: v.inode,
                     whiteout: false,
-                    opaque: false,
+                    // Check if directory is opaque.
+                    opaque: layer.is_opaque_whiteout(ctx, v.inode)?,
                     stat: Some(v.attr),
-                    wh_name: None,
-                    opaque_inode: None,
-                }));
+                }))
             }
-
-            let (opaque, opaque_inode) = layer.is_opaque_whiteout(ctx, v.inode)?;
-
-            return Ok(Some(RealInodeStats {
-                inode: v.inode,
-                whiteout: false,
-                opaque,
-                stat: Some(v.attr),
-                wh_name: None,
-                opaque_inode,
-            }));
-        } else {
-            return Ok(None);
+            None => Ok(None),
         }
     }
 }
@@ -260,8 +252,12 @@ impl OverlayInode {
         let st = self.stat64(ctx)?;
 
         // must be directory
-        assert!(st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-        if let Some(ref ri) = *self.upper_inode.lock().unwrap() {
+        if !utils::is_dir(st) {
+            return Err(Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        // FIXME: should we remove this? @fangcun.zw
+        if let Some(ri) = self.upper_inode.lock().unwrap().as_ref() {
             if ri.opaque.load(Ordering::Relaxed) {
                 opaque = 1;
             }
@@ -283,10 +279,12 @@ impl OverlayInode {
         ctx: &Context,
         flags: u32,
         fuse_flags: u32,
-    ) -> Result<(Arc<BoxedLayer>, Option<Handle>, OpenOptions)> {
-        let ri = Arc::clone(&self.first_inode.lock().unwrap());
+    ) -> Result<(Arc<Box<Layer>>, Option<Handle>, OpenOptions)> {
+        let ri = &self.first_inode();
         if let Some(ref l) = ri.layer {
-            let (h, o) = l.open(ctx, ri.inode.load(Ordering::Relaxed), flags, fuse_flags)?;
+            let (h, o) = l
+                .fs()
+                .open(ctx, ri.inode.load(Ordering::Relaxed), flags, fuse_flags)?;
             Ok((Arc::clone(l), h, o))
         } else {
             Err(Error::new(ErrorKind::Other, "no first layer"))
@@ -300,20 +298,13 @@ impl OverlayInode {
     pub fn upper_layer_only(&self) -> bool {
         self.lower_inodes.len() == 0
     }
-}
 
-fn process_lower_layer(
-    manager: &PluginManager,
-    opaque: &[String],
-) -> Result<LinkedList<Arc<BoxedLayer>>> {
-    let mut layers = LinkedList::new();
-
-    for lower in opaque {
-        let mut lower_layers = plugin::process_onelayer(manager, lower.into(), false)?;
-        layers.append(&mut lower_layers);
+    pub fn first_inode(&self) -> Arc<RealInode> {
+        match self.upper_inode.lock().unwrap().as_ref() {
+            Some(v) => Arc::clone(v),
+            None => Arc::clone(&self.lower_inodes[0]),
+        }
     }
-
-    Ok(layers)
 }
 
 impl OverlayInode {
@@ -355,26 +346,16 @@ fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
 }
 
 impl OverlayFs {
-    pub fn new(manager: &PluginManager, params: Config) -> Result<Self> {
-        // upper dir
-        let mut layers =
-            plugin::process_onelayer(manager, String::from(params.upper.as_str()), true)?;
-
-        let upper_layer = if let Some(ref v) = layers.front() {
-            Some(Arc::clone(v))
-        } else {
-            None
-        };
-
-        // lower dir
-        let mut lower_layers = process_lower_layer(manager, params.lower.as_slice())?;
-
-        layers.append(&mut lower_layers);
+    pub fn new(
+        upper: Option<Arc<Box<Layer>>>,
+        lowers: Vec<Arc<Box<Layer>>>,
+        params: Config,
+    ) -> Result<Self> {
         // load root inode
         Ok(OverlayFs {
             config: params,
-            upper_layer,
-            layers,
+            lower_layers: lowers,
+            upper_layer: upper,
             inodes: Mutex::new(HashMap::new()),
             root: None,
             next_inode: AtomicU64::new(FUSE_ROOT_ID + 1),
@@ -391,15 +372,28 @@ impl OverlayFs {
     pub fn init_root(&mut self) -> Result<()> {
         let mut root = OverlayInode::new();
         root.inode = FUSE_ROOT_ID;
-        root.path = String::from(".");
+        root.path = String::from("");
         root.name = String::from("");
         root.entry_type = libc::DT_DIR as u32;
         root.lookups = Mutex::new(2);
         let ctx = Context::default();
 
-        let mut first = true;
-        for layer in self.layers.iter() {
-            let (opaque, _ino) = layer.is_opaque_whiteout(&ctx, FUSE_ROOT_ID)?;
+        // Update upper inode
+        if let Some(l) = self.upper_layer.as_ref() {
+            let real = Arc::new(RealInode {
+                layer: Some(Arc::clone(l)),
+                inode: AtomicU64::new(FUSE_ROOT_ID),
+                whiteout: AtomicBool::new(false),
+                opaque: AtomicBool::new(false),
+                hidden: AtomicBool::new(false),
+                invalid: AtomicBool::new(false),
+            });
+            root.upper_inode = Mutex::new(Some(real.clone()));
+        }
+
+        // Update lower inodes.
+        for layer in self.lower_layers.iter() {
+            let opaque = layer.is_opaque_whiteout(&ctx, FUSE_ROOT_ID)?;
             let real = RealInode {
                 layer: Some(Arc::clone(layer)),
                 inode: AtomicU64::new(FUSE_ROOT_ID),
@@ -410,32 +404,14 @@ impl OverlayFs {
             };
 
             let real_inode = Arc::new(real);
-
-            if first {
-                first = false;
-                root.first_inode = Mutex::new(Arc::clone(&real_inode));
-            }
-
-            if layer.is_upper() {
-                root.upper_inode = Mutex::new(Some(Arc::clone(&real_inode)));
-            } else {
-                root.lower_inodes.push(Arc::clone(&real_inode));
-            }
-
-            root.last_inode = Mutex::new(Arc::clone(&real_inode));
+            root.lower_inodes.push(Arc::clone(&real_inode));
         }
 
         let root_node = Arc::new(root);
 
         // insert root inode into hash
-        {
-            self.inodes
-                .lock()
-                .unwrap()
-                .insert(FUSE_ROOT_ID, Arc::clone(&root_node));
-        }
+        self.inode_add(FUSE_ROOT_ID, Arc::clone(&root_node));
 
-        let ctx = Context::default();
         info!("loading root directory\n");
         self.load_directory(&ctx, Arc::clone(&root_node))?;
 
@@ -451,7 +427,7 @@ impl OverlayFs {
     pub fn make_overlay_inode(
         &self,
         ris: &RealInodeStats,
-        layer: Arc<BoxedLayer>,
+        layer: Arc<Box<Layer>>,
     ) -> Result<OverlayInode> {
         let mut new = OverlayInode::new();
         new.whiteout.store(ris.whiteout, Ordering::Relaxed);
@@ -464,14 +440,12 @@ impl OverlayFs {
             invalid: AtomicBool::new(false),
         });
 
-        new.first_inode = Mutex::new(Arc::clone(&real_inode));
-        new.last_inode = Mutex::new(Arc::clone(&real_inode));
         new.lookups = Mutex::new(1);
         if layer.is_upper() {
             new.upper_inode = Mutex::new(Some(Arc::clone(&real_inode)));
         }
 
-        // FIXME: inode can be reclaimed, don't forget this. @fangcun.zw
+        // FIXME: inode can be reclaimed, we need a better inode allocator. @fangcun.zw
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
         if inode > VFS_MAX_INO {
             error!("reached maximum inode number: {}", VFS_MAX_INO);
@@ -492,74 +466,88 @@ impl OverlayFs {
         Ok(new)
     }
 
+    fn inode_add(&self, inode: u64, node: Arc<OverlayInode>) {
+        self.inodes.lock().unwrap().insert(inode, node);
+    }
+
+    fn inode_get(&self, inode: u64) -> Option<Arc<OverlayInode>> {
+        self.inodes
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .map(|v| Arc::clone(v))
+    }
+
+    fn inode_remove(&self, inode: u64) -> Option<Arc<OverlayInode>> {
+        self.inodes.lock().unwrap().remove(&inode)
+    }
+
+    // Lookup child OverlayInode with <name> under <parent> directory.
+    // If name is empty, return parent itself.
     pub fn lookup_node(
         &self,
         ctx: &Context,
         parent: Inode,
-        name: &CStr,
+        name: &str,
     ) -> Result<Arc<OverlayInode>> {
-        if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
+        if name.contains(&[SLASH_ASCII as char]) {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
-        // lookup name
-        let pnode = {
-            let inodes = self.inodes.lock().unwrap();
-            if let Some(v) = inodes.get(&parent) {
-                Arc::clone(v)
-            } else {
-                // no parent inode?
-                return Err(Error::from_raw_os_error(libc::EINVAL));
-            }
+        // Parent inode is expected to be loaded before this function is called.
+        let pnode = match self.inode_get(parent) {
+            Some(v) => v,
+            // No parent inode indicates an internal bug.
+            None => return Err(Error::from_raw_os_error(libc::EINVAL)),
         };
 
-        let sname = name.to_string_lossy().into_owned().to_owned();
-        if sname.starts_with(WHITEOUT_PREFIX) {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
-
-        if sname.eq(".") || (parent == FUSE_ROOT_ID && sname.eq("..")) || sname.is_empty() {
-            return Ok(Arc::clone(&pnode));
-        }
-
+        // Parent is whiteout-ed, return ENOENT.
         if pnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
-        // found the node
-        if let Some(v) = pnode.childrens.lock().unwrap().get(sname.as_str()) {
+        // Current dir
+        if name.eq(".")  
+            // Root directory has no parent.
+            || (parent == FUSE_ROOT_ID && name.eq("..")) 
+            // Special convention: empty name indicates current dir.
+            || name.is_empty()
+        {
+            return Ok(Arc::clone(&pnode));
+        }
+
+        // Child is found.
+        if let Some(v) = pnode.childrens.lock().unwrap().get(name) {
             return Ok(Arc::clone(v));
         }
 
-        // if the directory is already loaded, not found
-        // we will change dir/file, we will toggle loaded
-        // flag to scan directory
+        // If the directory is already loaded, return ENOENT directly.
         if pnode.loaded.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
-        // don't find it, lookup in layers
-        let mut path = String::from(pnode.path.as_str());
-        path.push_str("/");
-        path.push_str(sname.as_str());
+        // Start to scan the directory.
+        let path = format!("{}/{}", pnode.path, name);
 
         let mut node_inited: bool = false;
         let mut new = OverlayInode::new();
 
-        // lookup until meet whiteout/opaque whiteout/file in lower layer..
-        {
-            if let Some(ref ri) = *pnode.upper_inode.lock().unwrap() {
-                // find an entry
-                if let Some(ris) = ri.lookup_node(ctx, name)? {
-                    node_inited = true;
-                    new = self.make_overlay_inode(&ris, Arc::clone(ri.layer.as_ref().unwrap()))?;
-                }
+        // Lookup until meet whiteout/opaque-whiteout/file in lower layer.
+
+        // Find it in upper layer.
+        let a = pnode.upper_inode.lock().unwrap();
+        if let Some(ri) = a.as_ref() {
+            // find an entry
+            if let Some(ris) = ri.lookup_node(ctx, name)? {
+                node_inited = true;
+                new = self.make_overlay_inode(&ris, Arc::clone(ri.layer.as_ref().unwrap()))?;
             }
         }
 
         'layer_loop: for ri in &pnode.lower_inodes {
+            // Find an entry.
             if let Some(ris) = ri.lookup_node(ctx, name)? {
-                // find an entry
+                // TODO: remove unwrap(). @fangcun.zw
                 let layer = Arc::clone(ri.layer.as_ref().unwrap());
                 let real_inode = Arc::new(RealInode {
                     layer: Some(Arc::clone(&layer)),
@@ -570,23 +558,25 @@ impl OverlayFs {
                     invalid: AtomicBool::new(false),
                 });
 
+                // TODO: 这部分看起来很有问题。  @fangcun.zw
                 if !node_inited {
                     node_inited = true;
                     new = self.make_overlay_inode(&ris, Arc::clone(&layer))?;
                     new.lower_inodes.push(Arc::clone(&real_inode));
 
-                    // should stop?
+                    // This is whiteout, no need to check lower layers.
                     if ris.whiteout {
                         break 'layer_loop;
                     }
 
                     // not whiteout, must have stat
-                    let st = ris.stat.as_ref().unwrap();
-                    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    let st = ris.stat.ok_or(Error::from_raw_os_error(libc::EINVAL))?;
+                    // A non-directory file shadows all lower layers as default.
+                    if !utils::is_dir(st) {
                         break 'layer_loop;
                     }
 
-                    // opaque?
+                    // Opaque directory shadows all lower layers.
                     if ris.opaque {
                         break 'layer_loop;
                     }
@@ -597,16 +587,13 @@ impl OverlayFs {
                     }
 
                     // not whiteout, must have stat
-                    let st = ris.stat.as_ref().unwrap();
-                    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    let st = ris.stat.ok_or(Error::from_raw_os_error(libc::EINVAL))?;
+                    if !utils::is_dir(st) {
                         break 'layer_loop;
                     }
 
                     // directory
-                    if node_inited {
-                        new.lower_inodes.push(Arc::clone(&real_inode));
-                        new.last_inode = Mutex::new(Arc::clone(&real_inode));
-                    }
+                    new.lower_inodes.push(Arc::clone(&real_inode));
 
                     // opaque?
                     if ris.opaque {
@@ -618,20 +605,17 @@ impl OverlayFs {
 
         if node_inited {
             new.path = String::from(path.as_str());
-            new.name = String::from(sname.as_str());
+            new.name = String::from(name);
             // set its parent node
-            *new.parent.lock().unwrap() = Arc::downgrade(&pnode);
+            new.parent = Mutex::new(Arc::downgrade(&pnode));
             // insert node into hashs
             let new_node = Arc::new(new);
-            self.inodes
-                .lock()
-                .unwrap()
-                .insert(new_node.inode as u64, Arc::clone(&new_node));
+            self.inode_add(new_node.inode as u64, Arc::clone(&new_node));
             pnode
                 .childrens
                 .lock()
                 .unwrap()
-                .insert(sname, Arc::clone(&new_node));
+                .insert(name.to_string(), Arc::clone(&new_node));
             return Ok(Arc::clone(&new_node));
         }
 
@@ -643,7 +627,7 @@ impl OverlayFs {
         &self,
         ctx: &Context,
         parent: u64,
-        name: &CStr,
+        name: &str,
     ) -> Result<Option<Arc<OverlayInode>>> {
         match self.lookup_node(ctx, parent, name) {
             Ok(n) => {
@@ -662,13 +646,14 @@ impl OverlayFs {
     }
 
     pub fn get_node_from_inode(&self, inode: u64) -> Option<Arc<OverlayInode>> {
-        if let Some(v) = self.inodes.lock().unwrap().get(&inode) {
-            return Some(Arc::clone(v));
+        if let Some(v) = self.inode_get(inode) {
+            return Some(v);
         }
 
         return None;
     }
 
+    // Load directory entries from one specific layer, layer can be upper or some one of lower layers.
     pub fn load_directory_layer(
         &self,
         ctx: &Context,
@@ -680,7 +665,7 @@ impl OverlayFs {
         }
 
         if let Some(st) = real.stat64_ignore_enoent(ctx)? {
-            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            if !utils::is_dir(st) {
                 return Err(Error::from_raw_os_error(libc::ENOTDIR));
             }
 
@@ -688,7 +673,8 @@ impl OverlayFs {
             let l = Arc::clone(real.layer.as_ref().unwrap());
             let rinode = real.inode.load(Ordering::Relaxed);
 
-            let handle = if let (Some(h), _) = l.opendir(ctx, rinode, libc::O_RDONLY as u32)? {
+            // Open the directory and load each entry.
+            let handle = if let (Some(h), _) = l.fs().opendir(ctx, rinode, libc::O_RDONLY as u32)? {
                 h
             } else {
                 return Err(Error::new(ErrorKind::Other, "no dir handle"));
@@ -699,7 +685,7 @@ impl OverlayFs {
             let bufsize = 1024;
             while more {
                 more = false;
-                l.readdir(
+                l.fs().readdir(
                     ctx,
                     rinode,
                     handle,
@@ -708,28 +694,23 @@ impl OverlayFs {
                     &mut |d| -> Result<usize> {
                         more = true;
                         offset = d.offset;
-                        let cname = unsafe { CString::from_vec_unchecked(d.name.to_vec()) };
-                        let cstr_name = cname.as_c_str();
+                        let child_name = String::from_utf8_lossy(d.name).into_owned();
 
-                        let child_name = cstr_name.to_string_lossy().into_owned().to_owned();
+                        debug!("entry: {}", child_name.as_str());
 
-                        info!("entry: {}", child_name.as_str());
-
-                        if child_name.eq(CURRENT_DIR)
-                            || child_name.eq(PARENT_DIR)
-                            || child_name.starts_with(WHITEOUT_PREFIX)
-                        {
+                        if child_name.eq(CURRENT_DIR) || child_name.eq(PARENT_DIR) {
                             return Ok(1);
                         }
 
-                        self.lookup_node(ctx, ovl_inode, cstr_name)?;
+                        self.lookup_node(ctx, ovl_inode, child_name.as_str())?;
 
                         Ok(1)
                     },
                 )?;
             }
 
-            l.releasedir(ctx, rinode, libc::O_RDONLY as u32, handle)?;
+            l.fs()
+                .releasedir(ctx, rinode, libc::O_RDONLY as u32, handle)?;
         } else {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
@@ -747,14 +728,16 @@ impl OverlayFs {
         };
 
         if let Some(ref ui) = tmp_ui {
-            debug!("load upper for {}", node.path.as_str());
+            debug!("load upper for '{}'", node.path.as_str());
             // upper layer
             if ui.whiteout.load(Ordering::Relaxed) || ui.invalid.load(Ordering::Relaxed) {
+                debug!("directory is whiteout or invalid");
                 return Ok(());
             }
 
             if let Some(st) = ui.stat64_ignore_enoent(ctx)? {
-                if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                if !utils::is_dir(st) {
+                    debug!("it's not a directory");
                     // not directory
                     return Ok(());
                 }
@@ -766,29 +749,43 @@ impl OverlayFs {
             // if opaque, stop here
             if ui.opaque.load(Ordering::Relaxed) {
                 node.loaded.store(true, Ordering::Relaxed);
+                debug!("directory is opaque");
                 return Ok(());
             }
         }
 
         // read out directories from each layer
-        'layer_loop: for li in &node.lower_inodes {
-            debug!("loading lower for {}", node.path.as_str());
-            if li.whiteout.load(Ordering::Relaxed) || li.invalid.load(Ordering::Relaxed) {
+        let mut counter = 1;
+        'layer_loop: for ri in &node.lower_inodes {
+            debug!("loading lower {} for '{}'", counter, node.path.as_str());
+            counter += 1;
+            if ri.whiteout.load(Ordering::Relaxed) || ri.invalid.load(Ordering::Relaxed) {
                 break 'layer_loop;
             }
 
-            if let Some(st) = li.stat64_ignore_enoent(ctx)? {
-                if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            if let Some(st) = ri.stat64_ignore_enoent(ctx)? {
+                if !utils::is_dir(st) {
                     // not directory
                     break 'layer_loop;
                 }
 
                 // process this layer
-                self.load_directory_layer(ctx, node.inode, Arc::clone(li))?;
+                match self.load_directory_layer(ctx, node.inode, Arc::clone(ri)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if let Some(raw_error) = e.raw_os_error() {
+                            if raw_error == libc::ENOENT {
+                                continue 'layer_loop;
+                            }
+                        }
+
+                        return Err(e);
+                    }
+                }
             }
 
             // if opaque, stop here
-            if li.opaque.load(Ordering::Relaxed) {
+            if ri.opaque.load(Ordering::Relaxed) {
                 break 'layer_loop;
             }
         }
@@ -810,40 +807,20 @@ impl OverlayFs {
         self.load_directory(ctx, node)
     }
 
-    pub fn get_first_layer(&self) -> Option<Arc<BoxedLayer>> {
-        if let Some(v) = self.layers.front() {
-            Some(Arc::clone(v))
+    pub fn get_first_lower_layer(&self) -> Option<Arc<Box<Layer>>> {
+        if self.lower_layers.len() > 0 {
+            Some(Arc::clone(&self.lower_layers[0]))
         } else {
             None
         }
     }
 
-    pub fn get_upper_layer(&self) -> Option<Arc<BoxedLayer>> {
-        if let Some(ref v) = self.upper_layer.as_ref() {
-            Some(Arc::clone(v))
-        } else {
-            None
+    pub fn get_first_layer(&self) -> Option<Arc<Box<Layer>>> {
+        if let Some(ref l) = self.upper_layer {
+            return Some(Arc::clone(l));
         }
-    }
 
-    pub fn get_first_lower_layer(&self) -> Option<Arc<BoxedLayer>> {
-        if let Some(ref _v) = self.upper_layer.as_ref() {
-            let mut index = 0;
-            for layer in self.layers.iter() {
-                if index == 1 {
-                    return Some(Arc::clone(layer));
-                }
-                index += 1;
-            }
-
-            None
-        } else {
-            if let Some(v) = self.layers.front() {
-                Some(Arc::clone(v))
-            } else {
-                None
-            }
-        }
+        self.get_first_lower_layer()
     }
 
     pub fn forget_one(&self, inode: Inode, count: u64) {
@@ -852,8 +829,8 @@ impl OverlayFs {
         }
 
         let v = {
-            if let Some(n) = self.inodes.lock().unwrap().get(&inode) {
-                Arc::clone(n)
+            if let Some(n) = self.inode_get(inode) {
+                n
             } else {
                 return;
             }
@@ -870,7 +847,7 @@ impl OverlayFs {
         // remove it from hashmap
 
         if *lookups == 0 {
-            self.inodes.lock().unwrap().remove(&inode);
+            let _ = self.inode_remove(inode);
             let parent = v.parent.lock().unwrap();
 
             if let Some(p) = parent.upgrade() {
@@ -884,21 +861,20 @@ impl OverlayFs {
 
     pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
         if let Some(v) = self.get_first_layer() {
-            if let Ok(sfs) = v.statfs(ctx, inode) {
+            if let Ok(sfs) = v.fs().statfs(ctx, inode) {
                 return Ok(sfs);
             }
         }
 
         // otherwise stat on mountpoint
         let mut sfs = MaybeUninit::<libc::statvfs64>::zeroed();
-        let cpath = CString::new(self.config.mountpoint.as_str()).expect("invalid path");
+        // FIXME: mountpoint may not exists at all. @fangcun.zw
+        let cpath = utils::to_cstring(self.config.mountpoint.as_str())?;
         let path = cpath.as_c_str().as_ptr();
 
         match unsafe { libc::statvfs64(path, sfs.as_mut_ptr()) } {
             0 => {
-                let mut sfs = unsafe { sfs.assume_init() };
-                sfs.f_namemax -= WHITEOUT_MAX_LEN;
-
+                let sfs = unsafe { sfs.assume_init() };
                 Ok(sfs)
             }
 
@@ -909,7 +885,7 @@ impl OverlayFs {
     pub fn get_fs_namemax(&self, ctx: &Context) -> u64 {
         match self.do_statvfs(ctx, FUSE_ROOT_ID) {
             Ok(sfs) => sfs.f_namemax,
-            Err(_) => 255 - WHITEOUT_MAX_LEN,
+            Err(_) => 255,
         }
     }
 
@@ -921,6 +897,12 @@ impl OverlayFs {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
     ) -> Result<()> {
+        trace!(
+            "do_reddir: handle: {}, size: {}, offset: {}",
+            handle,
+            size,
+            offset
+        );
         if size == 0 {
             return Ok(());
         }
@@ -933,12 +915,6 @@ impl OverlayFs {
         // lookup the directory
         if let Some(dir) = self.handles.lock().unwrap().get(&handle) {
             let mut len: usize = 0;
-            debug!(
-                "overlay dir: {}, off: {}, size: {}",
-                dir.node.path.as_str(),
-                offset,
-                size
-            );
 
             let childrens = if let Some(ref cs) = dir.childrens {
                 cs
@@ -1026,9 +1002,9 @@ impl OverlayFs {
             // create directory here
             let upper = Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().unwrap());
             let layer = Arc::clone(upper.layer.as_ref().unwrap());
-            let cname = CString::new(node.name.as_str()).expect("invalid c string");
+            let cname = utils::to_cstring(node.name.as_str())?;
             let st = node.stat64(ctx)?;
-            let entry = layer.mkdir(
+            let entry = layer.fs().mkdir(
                 ctx,
                 upper.inode.load(Ordering::Relaxed),
                 cname.as_c_str(),
@@ -1049,7 +1025,6 @@ impl OverlayFs {
             // what about st_ino/mode/dev..
             // FIXME: update st_ino/mode/dev, or query it from layer
             // on fly?
-            *node.first_inode.lock().unwrap() = Arc::clone(&real_inode);
             *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
 
             return Ok(());
@@ -1067,6 +1042,12 @@ impl OverlayFs {
             return Ok(node);
         }
 
+        let upper = self
+            .upper_layer
+            .as_ref()
+            .map(|v| v.clone())
+            .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
+
         let pnode = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
             Arc::clone(n)
         } else {
@@ -1075,23 +1056,23 @@ impl OverlayFs {
 
         let st = node.stat64(ctx)?;
 
-        let empty_name = CString::new("").expect("invalid c string");
-        let upper = self.get_upper_layer().unwrap();
-        let pnode = self.lookup_node(ctx, pnode.inode, empty_name.as_c_str())?;
+        let pnode = self.lookup_node(ctx, pnode.inode, "")?;
 
         assert!(pnode.in_upper_layer());
         assert!(st.st_mode & libc::S_IFMT == libc::S_IFLNK);
         let parent_real_inode = Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().unwrap());
-        let cname = CString::new(node.name.as_str()).expect("invalid c string");
-        let node = self.lookup_node(ctx, pnode.inode, cname.as_c_str())?;
-        let rinode = Arc::clone(&node.first_inode.lock().unwrap());
+        let node = self.lookup_node(ctx, pnode.inode, node.name.as_str())?;
+        let rinode = &node.first_inode();
         let layer = Arc::clone(rinode.layer.as_ref().unwrap());
 
         // symlink
         // first inode, upper most layer inode
-        let path = layer.readlink(ctx, rinode.inode.load(Ordering::Relaxed))?;
+        let path = layer
+            .fs()
+            .readlink(ctx, rinode.inode.load(Ordering::Relaxed))?;
         let cpath = unsafe { CString::from_vec_unchecked(path) };
-        let entry = upper.symlink(
+        let cname = utils::to_cstring(node.name.as_str())?;
+        let entry = upper.fs().symlink(
             ctx,
             cpath.as_c_str(),
             parent_real_inode.inode.load(Ordering::Relaxed),
@@ -1099,7 +1080,7 @@ impl OverlayFs {
         )?;
 
         let real_inode = Arc::new(RealInode {
-            layer: Some(Arc::clone(&upper)),
+            layer: Some(upper),
             inode: AtomicU64::new(entry.inode),
             whiteout: AtomicBool::new(false),
             opaque: AtomicBool::new(false),
@@ -1107,9 +1088,8 @@ impl OverlayFs {
             invalid: AtomicBool::new(false),
         });
 
-        // update first_inode and upper_inode
+        // update first_inode() and upper_inode
         *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
-        *node.first_inode.lock().unwrap() = Arc::clone(&real_inode);
 
         return Ok(Arc::clone(&node));
     }
@@ -1122,6 +1102,11 @@ impl OverlayFs {
         if self.node_in_upper_layer(Arc::clone(&node))? {
             return Ok(node);
         }
+        let upper = self
+            .upper_layer
+            .as_ref()
+            .map(|v| v.clone())
+            .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
 
         let pnode = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
             Arc::clone(n)
@@ -1131,20 +1116,15 @@ impl OverlayFs {
 
         let st = node.stat64(ctx)?;
 
-        let empty_name = CString::new("").expect("invalid c string");
-        let upper = self.get_upper_layer().unwrap();
-        let pnode = self.lookup_node(ctx, pnode.inode, empty_name.as_c_str())?;
+        let pnode = self.lookup_node(ctx, pnode.inode, "")?;
 
         assert!(pnode.in_upper_layer());
-        assert!(
-            st.st_mode & libc::S_IFMT != libc::S_IFLNK
-                && st.st_mode & libc::S_IFMT != libc::S_IFDIR
-        );
+        assert!(st.st_mode & libc::S_IFMT != libc::S_IFLNK && !utils::is_dir(st));
 
         let parent_real_inode = Arc::clone(pnode.upper_inode.lock().unwrap().as_ref().unwrap());
-        let cname = CString::new(node.name.as_str()).expect("invalid c string");
-        let node = self.lookup_node(ctx, pnode.inode, cname.as_c_str())?;
-        let rinode = Arc::clone(&node.first_inode.lock().unwrap());
+        let cname = utils::to_cstring(node.name.as_str())?;
+        let node = self.lookup_node(ctx, pnode.inode, node.name.as_str())?;
+        let rinode = &node.first_inode();
         let layer = Arc::clone(rinode.layer.as_ref().unwrap());
 
         // create the file in upper layer using information from lower layer
@@ -1156,7 +1136,7 @@ impl OverlayFs {
             fuse_flags: 0,
         };
 
-        let (entry, h, _) = upper.create(
+        let (entry, h, _) = upper.fs().create(
             ctx,
             parent_real_inode.inode.load(Ordering::Relaxed),
             cname.as_c_str(),
@@ -1179,7 +1159,7 @@ impl OverlayFs {
 
         let dst_handle = h.unwrap();
 
-        let (h, _) = layer.open(
+        let (h, _) = layer.fs().open(
             ctx,
             rinode.inode.load(Ordering::Relaxed),
             libc::O_RDONLY as u32,
@@ -1201,7 +1181,7 @@ impl OverlayFs {
         // stupid: to create a temp file for now..
         // FIXME: need to copy xattr, futimes, set origin.TODO
 
-        let template = CString::new("/tmp/fuse-overlay-XXXXXX").expect("invalid c string");
+        let template = utils::to_cstring("/tmp/fuse-overlay-XXXXXX")?;
         let template = template.into_raw();
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = unsafe { libc::mkostemp(template, flags) };
@@ -1214,7 +1194,7 @@ impl OverlayFs {
         let mut offset: usize = 0;
         let size = 4 * 1024 * 1024;
         loop {
-            let ret = layer.read(
+            let ret = layer.fs().read(
                 ctx,
                 rinode.inode.load(Ordering::Relaxed),
                 src_handle,
@@ -1234,7 +1214,7 @@ impl OverlayFs {
         file.seek(SeekFrom::Start(0))?;
         offset = 0;
         loop {
-            let ret = upper.write(
+            let ret = upper.fs().write(
                 ctx,
                 entry.inode,
                 dst_handle,
@@ -1259,7 +1239,7 @@ impl OverlayFs {
         }
 
         // close handles
-        layer.release(
+        layer.fs().release(
             ctx,
             rinode.inode.load(Ordering::Relaxed),
             0,
@@ -1268,11 +1248,12 @@ impl OverlayFs {
             true,
             None,
         )?;
-        upper.release(ctx, entry.inode, 0, dst_handle, true, true, None)?;
+        upper
+            .fs()
+            .release(ctx, entry.inode, 0, dst_handle, true, true, None)?;
 
-        // update upper_inode and first_inode
+        // update upper_inode and first_inode()
         *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
-        *node.first_inode.lock().unwrap() = Arc::clone(&real_inode);
 
         return Ok(Arc::clone(&node));
     }
@@ -1297,7 +1278,7 @@ impl OverlayFs {
         let st = node.stat64(ctx)?;
 
         // directory
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        if utils::is_dir(st) {
             self.create_node_directory(ctx, Arc::clone(&node))?;
             return Ok(Arc::clone(&node));
         }
@@ -1317,27 +1298,22 @@ impl OverlayFs {
         self.copy_regfile_up(ctx, Arc::clone(&node))
     }
 
-    pub fn is_upper_layer(&self, l: Arc<BoxedLayer>) -> bool {
+    pub fn is_upper_layer(&self, l: Arc<Box<Layer>>) -> bool {
         l.is_upper()
     }
 
     pub fn do_rm(&self, ctx: &Context, parent: u64, name: &CStr, dir: bool) -> Result<()> {
-        let _upper = if let Some(ref v) = self.upper_layer.as_ref() {
-            Arc::clone(v)
-        } else {
+        if self.upper_layer.is_none() {
             return Err(Error::from_raw_os_error(libc::EROFS));
-        };
+        }
 
-        let pnode = self.lookup_node(
-            ctx,
-            parent,
-            CString::new("").expect("invalid path!").as_c_str(),
-        )?;
+        let pnode = self.lookup_node(ctx, parent, "")?;
         if pnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
-        let node = self.lookup_node(ctx, parent, name)?;
+        let sname = name.to_string_lossy().to_string();
+        let node = self.lookup_node(ctx, parent, sname.as_str())?;
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
@@ -1383,9 +1359,9 @@ impl OverlayFs {
 
         if node.in_upper_layer() {
             if dir {
-                layer.rmdir(ctx, real_parent_inode, name)?;
+                layer.fs().rmdir(ctx, real_parent_inode, name)?;
             } else {
-                layer.unlink(ctx, real_parent_inode, name)?;
+                layer.fs().unlink(ctx, real_parent_inode, name)?;
             }
         }
 
@@ -1403,7 +1379,7 @@ impl OverlayFs {
             layer.create_whiteout(ctx, real_parent_inode, sname.as_str())?;
             pnode.loaded.store(false, Ordering::Relaxed);
             // readd whiteout node
-            self.lookup_node(ctx, parent, name)?;
+            self.lookup_node(ctx, parent, sname.as_str())?;
             pnode.loaded.store(true, Ordering::Relaxed);
         }
 
@@ -1416,7 +1392,7 @@ impl OverlayFs {
 
     pub fn empty_node_directory(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<()> {
         let st = node.stat64(ctx)?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        if !utils::is_dir(st) {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
@@ -1430,43 +1406,32 @@ impl OverlayFs {
         let layer = Arc::clone(real_node.layer.as_ref().unwrap());
         let real_inode = real_node.inode.load(Ordering::Relaxed);
 
-        // delete opaque
-        let copaque = CString::new(OPAQUE_WHITEOUT).expect("invalid c string");
-        let (opaque, _ino) = layer.is_opaque_whiteout(ctx, real_inode)?;
-        if opaque {
-            if layer
-                .lookup_ignore_enoent(ctx, real_inode, OPAQUE_WHITEOUT)?
-                .is_some()
-            {
-                layer.unlink(ctx, real_inode, copaque.as_c_str())?;
-            }
-        }
+        // Copy node.childrens Hashmap to Vec, the Vec is also used as temp storage,
+        // Without this, Rust won't allow us to remove them from node.childrens.
+        let iter = node
+            .childrens
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>();
 
-        let iter = {
-            let mut all = Vec::new();
-            for (_, v) in node.childrens.lock().unwrap().iter() {
-                all.push(Arc::clone(v));
-            }
-
-            all
-        };
-
-        for child in &iter {
+        for child in iter {
             if child.in_upper_layer() {
                 if child.whiteout.load(Ordering::Relaxed) {
                     layer.delete_whiteout(ctx, real_inode, child.name.as_str())?
                 } else {
                     let s = child.stat64(ctx)?;
-                    let cname = CString::new(child.name.as_str()).expect("invalid c string");
-                    if s.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    let cname = utils::to_cstring(&child.name)?;
+                    if utils::is_dir(s) {
                         let (count, whiteouts, opaque) = child.count_entries_and_whiteout(ctx)?;
                         if count + whiteouts + opaque > 0 {
                             self.empty_node_directory(ctx, Arc::clone(&child))?;
                         }
 
-                        layer.rmdir(ctx, real_inode, cname.as_c_str())?
+                        layer.fs().rmdir(ctx, real_inode, cname.as_c_str())?
                     } else {
-                        layer.unlink(ctx, real_inode, cname.as_c_str())?;
+                        layer.fs().unlink(ctx, real_inode, cname.as_c_str())?;
                     }
                 }
 
@@ -1498,7 +1463,7 @@ impl OverlayFs {
                 return Err(Error::new(ErrorKind::Other, "no parent"));
             };
 
-            let first_inode = pnode.first_inode.lock().unwrap();
+            let first_inode = pnode.first_inode();
 
             (
                 Arc::clone(first_inode.layer.as_ref().unwrap()),
@@ -1519,7 +1484,7 @@ impl OverlayFs {
         &self,
         _ctx: &Context,
         handle: Handle,
-    ) -> Result<(Arc<BoxedLayer>, Inode, Handle)> {
+    ) -> Result<(Arc<Box<Layer>>, Inode, Handle)> {
         if let Some(h) = self.handles.lock().unwrap().get(&handle) {
             if let Some(ref rhd) = h.real_handle {
                 let real_handle = rhd.handle.load(Ordering::Relaxed);
@@ -1537,9 +1502,9 @@ impl OverlayFs {
         &self,
         _ctx: &Context,
         inode: Inode,
-    ) -> Result<(Arc<BoxedLayer>, Inode)> {
+    ) -> Result<(Arc<Box<Layer>>, Inode)> {
         if let Some(n) = self.inodes.lock().unwrap().get(&inode) {
-            let first = n.first_inode.lock().unwrap();
+            let first = n.first_inode();
             let layer = Arc::clone(first.layer.as_ref().unwrap());
             let real_inode = first.inode.load(Ordering::Relaxed);
 

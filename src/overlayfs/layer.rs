@@ -1,33 +1,52 @@
 #![allow(missing_docs)]
 
-//use std::sync::{Arc, Weak};
+use super::*;
 use libc;
-use std::ffi::{CStr, CString};
-use std::io::{Error, Result};
+use std::ffi::CString;
+use std::io::{self, Error, Result};
 
-use self::super::{
-    OPAQUE_WHITEOUT, OPAQUE_XATTR, PRIVILEGED_OPAQUE_XATTR, UNPRIVILEGED_OPAQUE_XATTR,
-    WHITEOUT_PREFIX,
-};
-use crate::abi::fuse_abi::CreateIn;
 use crate::api::filesystem::{Context, Entry, FileSystem, GetxattrReply};
-use crate::api::VFS_MAX_INO;
 
 pub const OPAQUE_XATTR_LEN: u32 = 16;
+
+type BoxedFileSystem = Box<dyn FileSystem<Inode = Inode, Handle = Handle> + Send + Sync>;
+
+pub struct Layer {
+    fs: Arc<BoxedFileSystem>,
+    is_upper: bool,
+}
 
 // we cannot constraint Layer with Eq, as Eq requires Sized
 // So we need api to get an identifier and then use identifier
 // to do comparation.. Here may have better solutions..
-pub trait Layer: FileSystem {
-    fn init_layer(&mut self) -> Result<()>;
-    fn cleanup(&mut self) -> Result<()>;
-    fn is_upper(&self) -> bool;
+impl Layer {
+    pub fn new(fs: BoxedFileSystem, is_upper: bool) -> Self {
+        Layer {
+            fs: Arc::new(fs),
+            is_upper,
+        }
+    }
+
+    pub(crate) fn is_upper(&self) -> bool {
+        self.is_upper
+    }
+
+    pub(crate) fn fs(&self) -> Arc<BoxedFileSystem> {
+        self.fs.clone()
+    }
+
     // file exists, returns true, not exists return false
     // otherwise, error out
     // Ok(None) denotes no entry
-    fn lookup_ignore_enoent(&self, ctx: &Context, ino: u64, name: &str) -> Result<Option<Entry>> {
-        let cname = CString::new(name).expect("invalid c string");
-        match self.lookup(ctx, Self::Inode::from(ino), cname.as_c_str()) {
+    pub(crate) fn lookup_ignore_enoent(
+        &self,
+        ctx: &Context,
+        ino: u64,
+        name: &str,
+    ) -> Result<Option<Entry>> {
+        let cname = CString::new(name).map_err(|e| Error::new(io::ErrorKind::InvalidData, e))?;
+
+        match self.fs.lookup(ctx, ino, cname.as_c_str()) {
             Ok(v) => return Ok(Some(v)),
             Err(e) => {
                 if let Some(raw_error) = e.raw_os_error() {
@@ -41,21 +60,23 @@ pub trait Layer: FileSystem {
         }
     }
 
-    fn getxattr_ignore_nodata(
+    pub(crate) fn getxattr_ignore_nodata(
         &self,
         ctx: &Context,
         inode: u64,
         name: &str,
         size: u32,
     ) -> Result<Option<Vec<u8>>> {
-        let cname = CString::new(name).expect("invalid c string");
-        match self.getxattr(ctx, Self::Inode::from(inode), cname.as_c_str(), size) {
+        // TODO: map error?
+        let cname = CString::new(name)?;
+        match self.fs.getxattr(ctx, inode, cname.as_c_str(), size) {
             Ok(v) => {
+                // xattr name exists and we get value.
                 if let GetxattrReply::Value(buf) = v {
                     return Ok(Some(buf));
-                } else {
-                    return Ok(None);
                 }
+                // no value found.
+                return Ok(None);
             }
             Err(e) => {
                 if let Some(raw_error) = e.raw_os_error() {
@@ -72,178 +93,118 @@ pub trait Layer: FileSystem {
         }
     }
 
-    fn whiteout_exists(&self, ctx: &Context, ino: u64, name: &CStr) -> Result<(bool, u64, String)> {
-        let sname = name.to_string_lossy().into_owned().to_owned();
+    // Check is the inode is a whiteout.
+    pub(crate) fn is_whiteout(&self, ctx: &Context, inode: u64) -> Result<bool> {
+        let (st, _) = self.fs().getattr(ctx, inode, None)?;
 
-        let mut wh_name = String::from(WHITEOUT_PREFIX);
-        wh_name.push_str(sname.as_str());
-
-        // .wh.name exists
-        if let Some(v) = self.lookup_ignore_enoent(ctx, ino, wh_name.as_str())? {
-            return Ok((true, v.inode, wh_name));
-        }
-
-        // char node whiteout
-        if let Some(st) = self.lookup_ignore_enoent(ctx, ino, sname.as_str())? {
-            let major = unsafe { libc::major(st.attr.st_rdev) };
-            let minor = unsafe { libc::minor(st.attr.st_rdev) };
-            if st.attr.st_mode & libc::S_IFMT == libc::S_IFCHR && major == 0 && minor == 0 {
-                return Ok((true, st.inode, sname));
-            }
-        }
-
-        Ok((false, VFS_MAX_INO, String::from("")))
+        // Check attributes of the inode to see if it's a whiteout char device.
+        Ok(utils::is_whiteout(st))
     }
 
-    fn is_opaque_whiteout(&self, ctx: &Context, inode: u64) -> Result<(bool, Option<u64>)> {
-        let (st, _d) = self.getattr(ctx, Self::Inode::from(inode), None)?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+    // Check if the directory is opaque.
+    pub(crate) fn is_opaque_whiteout(&self, ctx: &Context, inode: u64) -> Result<bool> {
+        // Get attributes of the directory.
+        let (st, _d) = self.fs().getattr(ctx, inode, None)?;
+        if !utils::is_dir(st) {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        // check xattr first
+        // A directory is made opaque by setting the xattr "trusted.overlay.opaque" to "y".
+        // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
         if let Some(v) =
             self.getxattr_ignore_nodata(ctx, inode, PRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)?
         {
             if v[0].to_ascii_lowercase() == b'y' {
-                return Ok((true, None));
-            } else {
-                return Ok((false, None));
+                return Ok(true);
             }
+            return Ok(false);
         }
 
+        // Also check for the unprivileged version of the xattr.
         if let Some(v) =
             self.getxattr_ignore_nodata(ctx, inode, UNPRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)?
         {
             if v[0].to_ascii_lowercase() == b'y' {
-                return Ok((true, None));
-            } else {
-                return Ok((false, None));
+                return Ok(true);
             }
+            return Ok(false);
         }
 
+        // And our customized version of the xattr.
         if let Some(v) = self.getxattr_ignore_nodata(ctx, inode, OPAQUE_XATTR, OPAQUE_XATTR_LEN)? {
             if v[0].to_ascii_lowercase() == b'y' {
-                return Ok((true, None));
-            } else {
-                return Ok((false, None));
+                return Ok(true);
             }
+            return Ok(false);
         }
 
-        // check .wh..wh..opaque, hwoever, we have no parent inode number for the parent of .wh..wh..opaque
-        if let Some(v) = self.lookup_ignore_enoent(ctx, inode, OPAQUE_WHITEOUT)? {
-            return Ok((true, Some(v.inode)));
-        }
-
-        Ok((false, None))
+        Ok(false)
     }
 
-    fn delete_whiteout(&self, ctx: &Context, parent: u64, name: &str) -> Result<()> {
+    pub(crate) fn delete_whiteout(&self, ctx: &Context, parent: u64, name: &str) -> Result<()> {
         if !self.is_upper() {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
 
-        let mut wh_name = String::from(WHITEOUT_PREFIX);
-        wh_name.push_str(name);
-        let cwh_name = CString::new(wh_name.as_str()).expect("invalid c string");
-        let cname = CString::new(name).expect("invalid c string");
-
-        // .wh.name exists
-        if self
-            .lookup_ignore_enoent(ctx, parent, wh_name.as_str())?
-            .is_some()
-        {
-            self.unlink(ctx, Self::Inode::from(parent), cwh_name.as_c_str())?;
-        }
-
-        // char node whiteout
+        // Delete whiteout char dev with 0/0 device number.
         if let Some(st) = self.lookup_ignore_enoent(ctx, parent, name)? {
             let major = unsafe { libc::major(st.attr.st_rdev) };
             let minor = unsafe { libc::minor(st.attr.st_rdev) };
-            if st.attr.st_mode & libc::S_IFMT == libc::S_IFCHR && major == 0 && minor == 0 {
-                self.unlink(ctx, Self::Inode::from(parent), cname.as_c_str())?;
+            if utils::is_chardev(st.attr) && major == 0 && minor == 0 {
+                self.fs
+                    .unlink(ctx, parent, utils::to_cstring(name)?.as_c_str())?;
             }
         }
 
         Ok(())
     }
 
-    fn create_whiteout(&self, ctx: &Context, parent: u64, name: &str) -> Result<Entry> {
+    pub(crate) fn create_whiteout(&self, ctx: &Context, parent: u64, name: &str) -> Result<Entry> {
         if !self.is_upper() {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
 
-        let mut wh_name = String::from(WHITEOUT_PREFIX);
-        wh_name.push_str(name);
-        let cwh_name = CString::new(wh_name.as_str()).expect("invalid c string");
-        let cname = CString::new(name).expect("invalid c string");
-
-        let (exists, _inode, name) = self.whiteout_exists(ctx, parent, cname.as_c_str())?;
-
-        if exists {
-            return self.lookup(
-                ctx,
-                Self::Inode::from(parent),
-                CString::new(name.as_str())
-                    .expect("invalid c string")
-                    .as_c_str(),
-            );
+        let entry = self.lookup_ignore_enoent(ctx, parent, name)?;
+        match entry {
+            Some(v) => {
+                // Find whiteout char dev.
+                if utils::is_whiteout(v.attr) {
+                    return Ok(v);
+                }
+                // File exists with same name, create is not allowed.
+                return Err(Error::from_raw_os_error(libc::EEXIST));
+            }
+            // Continue the creation if whiteout file doesn't exist.
+            None => {}
         }
 
-        // try to creat .wh.name
-        let args = CreateIn {
-            flags: 0,
-            mode: 0o777,
-            umask: 0,
-            fuse_flags: 0,
-        };
-
-        if let Ok((entry, _h, _o)) =
-            self.create(ctx, Self::Inode::from(parent), cwh_name.as_c_str(), args)
-        {
-            // if let Some(handle) = h {
-            // 	self.release(ctx, Self::Inode::from(entry.inode), 0, handle, true, true, None)?;
-            // }
-
-            return Ok(entry);
-        }
-
-        // try mknod
+        // Try to create whiteout char device with 0/0 device number.
         let dev = libc::makedev(0, 0);
         let mode = libc::S_IFCHR | 0o777;
-        self.mknod(
+        self.fs.mknod(
             ctx,
-            Self::Inode::from(parent),
-            cname.as_c_str(),
+            parent,
+            utils::to_cstring(name)?.as_c_str(),
             mode,
             dev as u32,
             0,
         )
     }
 
-    fn create_opaque_whiteout(&self, ctx: &Context, parent: u64) -> Result<Entry> {
+    pub(crate) fn create_opaque_whiteout(&self, ctx: &Context, inode: u64) -> Result<()> {
         if !self.is_upper() {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
 
-        let cname = CString::new(OPAQUE_WHITEOUT).expect("invalid c string");
+        // A directory is made opaque by setting the xattr "trusted.overlay.opaque" to "y".
+        // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
 
-        // opaque whiteout exists
-        if let Some(v) = self.lookup_ignore_enoent(ctx, parent, OPAQUE_WHITEOUT)? {
-            return Ok(v);
-        }
-
-        // create
-        let args = CreateIn {
-            flags: 0,
-            mode: 0o777,
-            umask: 0,
-            fuse_flags: 0,
-        };
-
-        let (entry, _h, _o) =
-            self.create(ctx, Self::Inode::from(parent), cname.as_c_str(), args)?;
-
-        Ok(entry)
+        self.fs.setxattr(
+            ctx,
+            inode,
+            utils::to_cstring(OPAQUE_XATTR)?.as_c_str(),
+            b"y",
+            0,
+        )
     }
 }
