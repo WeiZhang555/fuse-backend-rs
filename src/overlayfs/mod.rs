@@ -314,35 +314,16 @@ impl OverlayInode {
 }
 
 fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
-    if mode & libc::S_IFBLK != 0 {
-        return libc::DT_BLK;
+    match mode & libc::S_IFMT {
+        libc::S_IFBLK => libc::DT_BLK,
+        libc::S_IFCHR => libc::DT_CHR,
+        libc::S_IFDIR => libc::DT_DIR,
+        libc::S_IFIFO => libc::DT_FIFO,
+        libc::S_IFLNK => libc::DT_LNK,
+        libc::S_IFREG => libc::DT_REG,
+        libc::S_IFSOCK => libc::DT_SOCK,
+        _ => libc::DT_UNKNOWN,
     }
-
-    if mode & libc::S_IFCHR != 0 {
-        return libc::DT_CHR;
-    }
-
-    if mode & libc::S_IFDIR != 0 {
-        return libc::DT_DIR;
-    }
-
-    if mode & libc::S_IFIFO != 0 {
-        return libc::DT_FIFO;
-    }
-
-    if mode & libc::S_IFLNK != 0 {
-        return libc::DT_LNK;
-    }
-
-    if mode & libc::S_IFREG != 0 {
-        return libc::DT_REG;
-    }
-
-    if mode & libc::S_IFSOCK != 0 {
-        return libc::DT_SOCK;
-    }
-
-    return libc::DT_UNKNOWN;
 }
 
 impl OverlayFs {
