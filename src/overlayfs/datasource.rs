@@ -1,4 +1,2 @@
-
 ///! DataSource trait
-pub trait DataSource {
-}
+pub trait DataSource {}
