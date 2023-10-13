@@ -98,6 +98,11 @@ impl FileSystem for OverlayFs {
         _flags: u32,
     ) -> Result<(Option<Handle>, OpenOptions)> {
         trace!("OPENDIR: inode: {}\n", inode);
+        if self.no_opendir.load(Ordering::Relaxed) {
+            info!("fuse: opendir is not supported.");
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+
         let mut opts = OpenOptions::empty();
 
         match self.config.cache_policy {
@@ -125,44 +130,47 @@ impl FileSystem for OverlayFs {
         // reload directory?
         self.reload_directory(ctx, Arc::clone(&node))?;
 
-        let mut cs = Vec::new();
-        //add myself
-        cs.push(Arc::clone(&node));
+        //let mut cs = Vec::new();
+        //add myself as "."
+        //let mut self_node = Arc::clone(&node);
+        // self_node.name = ".".to_string();
+        // cs.push(self_node);
 
-        //add parent
-        if let Some(p) = node.parent.lock().unwrap().upgrade() {
-            cs.push(p);
-        } else {
-            cs.push(Arc::clone(self.root.as_ref().ok_or_else(|| {
-                error!("OPENDIR: root is none");
-                Error::from_raw_os_error(libc::ENOENT)
-            })?));
-        };
+        // //add parent
+        // let mut parent_node = match node.parent.lock().unwrap().upgrade() {
+        //     Some(p) => p.clone(),
+        //     None => Arc::clone(self.root.as_ref().ok_or_else(|| {
+        //         error!("OPENDIR: root is none");
+        //         Error::from_raw_os_error(libc::ENOENT)
+        //     })?),
+        // };
+        // parent_node.name = "..".to_string();
+        // cs.push(parent_node);
 
-        for (_, child) in node.childrens.lock().unwrap().iter() {
-            // skip whiteout node
-            if child.whiteout.load(Ordering::Relaxed) || child.hidden.load(Ordering::Relaxed) {
-                continue;
-            }
-            // *child.lookups.lock().unwrap() += 1;
-            cs.push(Arc::clone(child));
-        }
+        // for (_, child) in node.childrens.lock().unwrap().iter() {
+        //     // skip whiteout node
+        //     if child.whiteout.load(Ordering::Relaxed) || child.hidden.load(Ordering::Relaxed) {
+        //         continue;
+        //     }
+        //     // *child.lookups.lock().unwrap() += 1;
+        //     cs.push(Arc::clone(child));
+        // }
 
-        // TODO: is this necessary to increase lookup count?
-        for c in cs.iter() {
-            c.lookups.fetch_add(1, Ordering::Relaxed);
-        }
+        // TODO: is this necessary to increase lookup count? @weizhang555
+        // for c in cs.iter() {
+        //     c.lookups.fetch_add(1, Ordering::Relaxed);
+        // }
 
-        node.lookups.fetch_add(1, Ordering::Relaxed);
+        //node.lookups.fetch_add(1, Ordering::Relaxed);
 
         self.handles.lock().unwrap().insert(
             handle,
-            HandleData {
+            Arc::new(HandleData {
                 node: Arc::clone(&node),
-                childrens: Some(cs),
+                //               childrens: Some(cs),
                 offset: 0,
                 real_handle: None,
-            },
+            }),
         );
 
         Ok((Some(handle), opts))
@@ -170,17 +178,19 @@ impl FileSystem for OverlayFs {
 
     fn releasedir(&self, _ctx: &Context, inode: Inode, _flags: u32, handle: Handle) -> Result<()> {
         trace!("RELEASEDIR: inode: {}, handle: {}\n", inode, handle);
-        {
-            if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-                if v.childrens.as_ref().is_some() {
-                    for child in v.childrens.as_ref().unwrap() {
-                        self.forget_one(child.inode, 1);
-                    }
-                }
-
-                self.forget_one(v.node.inode, 1);
-            }
+        if self.no_opendir.load(Ordering::Relaxed) {
+            info!("fuse: releasedir is not supported.");
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
+        // {
+        //     if let Some(v) = self.handles.lock().unwrap().get(&handle) {
+        //         for child in v.node.childrens().values() {
+        //             self.forget_one(child.inode, 1);
+        //         }
+
+        //         self.forget_one(v.node.inode, 1);
+        //     }
+        // }
 
         self.handles.lock().unwrap().remove(&handle);
 
@@ -247,16 +257,14 @@ impl FileSystem for OverlayFs {
         let real_parent_inode = real_pnode.inode.load(Ordering::Relaxed);
 
         if delete_whiteout {
-            let _ = upper.delete_whiteout(ctx, real_parent_inode, sname.as_str());
+            let _ = upper.delete_whiteout(ctx, real_parent_inode, name);
         }
 
         // create dir in upper layer
-        let entry = upper
-            .fs()
-            .mkdir(ctx, real_parent_inode, name, mode, umask)?;
+        let entry = upper.mkdir(ctx, real_parent_inode, name, mode, umask)?;
 
         if !upper_layer_only {
-            upper.create_opaque_whiteout(ctx, entry.inode)?;
+            upper.set_opaque(ctx, entry.inode)?;
             _opaque = true;
         }
 
@@ -287,46 +295,50 @@ impl FileSystem for OverlayFs {
     fn readdir(
         &self,
         ctx: &Context,
-        _inode: Inode,
+        inode: Inode,
         handle: Handle,
         size: u32,
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry) -> Result<usize>,
     ) -> Result<()> {
-        trace!("READDIR: inode: {}, handle: {}\n", _inode, handle);
-        self.do_readdir(
-            ctx,
-            handle,
-            size,
-            offset,
-            false,
-            &mut |dir_entry, _| -> Result<usize> { add_entry(dir_entry) },
-        )
+        trace!("READDIR: inode: {}, handle: {}\n", inode, handle);
+        if self.config.no_readdir {
+            info!("fuse: readdir is not supported.");
+            return Ok(());
+        }
+        self.do_readdir(ctx, inode, handle, size, offset, false, &mut |dir_entry,
+                                                                       _|
+         -> Result<
+            usize,
+        > {
+            add_entry(dir_entry)
+        })
     }
 
     fn readdirplus(
         &self,
         ctx: &Context,
-        _inode: Inode,
+        inode: Inode,
         handle: Handle,
         size: u32,
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
     ) -> Result<()> {
-        trace!("READDIRPLUS: inode: {}, handle: {}\n", _inode, handle);
-        self.do_readdir(
-            ctx,
-            handle,
-            size,
-            offset,
-            true,
-            &mut |dir_entry, entry| -> Result<usize> {
-                match entry {
-                    Some(e) => add_entry(dir_entry, e),
-                    None => Err(Error::from_raw_os_error(libc::ENOENT)),
-                }
-            },
-        )
+        trace!("READDIRPLUS: inode: {}, handle: {}\n", inode, handle);
+        if self.config.no_readdir {
+            info!("fuse: readdirplus is not supported.");
+            return Ok(());
+        }
+        self.do_readdir(ctx, inode, handle, size, offset, true, &mut |dir_entry,
+                                                                      entry|
+         -> Result<
+            usize,
+        > {
+            match entry {
+                Some(e) => add_entry(dir_entry, e),
+                None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            }
+        })
     }
 
     fn open(
@@ -335,9 +347,13 @@ impl FileSystem for OverlayFs {
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> Result<(Option<Handle>, OpenOptions)> {
+    ) -> Result<(Option<Handle>, OpenOptions, Option<u32>)> {
         // open assume file always exist
         trace!("OPEN: inode: {}, flags: {}\n", inode, flags);
+        if self.no_open.load(Ordering::Relaxed) {
+            info!("fuse: open is not supported.");
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
 
         let readonly: bool = flags
             & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
@@ -358,7 +374,6 @@ impl FileSystem for OverlayFs {
                 flags &= !libc::O_APPEND;
             }
         }
-
         // lookup node
         let node = self.lookup_node(ctx, inode, "")?;
 
@@ -374,34 +389,38 @@ impl FileSystem for OverlayFs {
 
         // assign a handle in overlayfs and open it
         let (_l, h, _) = node.open(ctx, flags as u32, fuse_flags)?;
-        if let Some(handle) = h {
-            let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let handle_data = HandleData {
-                node: Arc::clone(&node),
-                childrens: None,
-                offset: 0,
-                real_handle: Some(RealHandle {
-                    real_inode: node.first_inode(),
-                    handle: AtomicU64::new(handle),
-                    invalid: AtomicBool::new(false),
-                }),
-            };
+        match h {
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            Some(handle) => {
+                let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                let handle_data = HandleData {
+                    node: Arc::clone(&node),
+                    //               childrens: None,
+                    offset: 0,
+                    real_handle: Some(RealHandle {
+                        real_inode: node.first_inode(),
+                        handle: AtomicU64::new(handle),
+                        invalid: AtomicBool::new(false),
+                    }),
+                };
 
-            self.handles.lock().unwrap().insert(hd, handle_data);
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(hd, Arc::new(handle_data));
 
-            let mut opts = OpenOptions::empty();
-            match self.config.cache_policy {
-                CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-                CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-                _ => {}
+                let mut opts = OpenOptions::empty();
+                match self.config.cache_policy {
+                    CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+                    CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+                    _ => {}
+                }
+
+                trace!("OPEN: returning handle: {}", hd);
+
+                Ok((Some(hd), opts, None))
             }
-
-            trace!("OPEN: returning handle: {}", hd);
-
-            return Ok((Some(hd), opts));
         }
-
-        Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
     fn release(
@@ -423,6 +442,12 @@ impl FileSystem for OverlayFs {
             flock_release,
             lock_owner
         );
+
+        if self.no_open.load(Ordering::Relaxed) {
+            info!("fuse: release is not supported.");
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+
         if let Some(hd) = self.handles.lock().unwrap().get(&handle) {
             let rh = if let Some(ref h) = hd.real_handle {
                 h
@@ -440,7 +465,7 @@ impl FileSystem for OverlayFs {
                     error!("RELEASE: real inode layer is none");
                     Error::from_raw_os_error(libc::EINVAL)
                 })?;
-            l.fs().release(
+            l.release(
                 ctx,
                 real_inode,
                 flags,
@@ -462,7 +487,7 @@ impl FileSystem for OverlayFs {
         parent: Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> Result<(Entry, Option<Handle>, OpenOptions)> {
+    ) -> Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
         let mut is_whiteout = false;
         let sname = name.to_string_lossy().to_string();
         trace!("CREATE: parent: {}, name: {}\n", parent, sname);
@@ -523,7 +548,7 @@ impl FileSystem for OverlayFs {
             })?;
             if node.in_upper_layer() {
                 // whiteout in upper layer, need to delete
-                first_layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
+                first_layer.delete_whiteout(ctx, real_parent_inode, name)?;
             }
 
             // delete inode from inodes and childrens
@@ -531,7 +556,7 @@ impl FileSystem for OverlayFs {
             pnode.childrens.lock().unwrap().remove(sname.as_str());
         }
 
-        let (_entry, h, _) = upper.fs().create(ctx, real_parent_inode, name, hargs)?;
+        let (_entry, h, _, _) = upper.create(ctx, real_parent_inode, name, hargs)?;
 
         // record inode, handle
         // lookup will insert inode into children and inodes hash
@@ -554,22 +579,30 @@ impl FileSystem for OverlayFs {
                 Error::from_raw_os_error(libc::EINVAL)
             })?);
 
-        let final_handle = if let Some(hd) = h {
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let handle_data = HandleData {
-                node: Arc::clone(&node),
-                childrens: None,
-                offset: 0,
-                real_handle: Some(RealHandle {
-                    real_inode: Arc::clone(&real_inode),
-                    handle: AtomicU64::new(hd),
-                    invalid: AtomicBool::new(false),
-                }),
-            };
-            self.handles.lock().unwrap().insert(handle, handle_data);
-            Some(handle)
-        } else {
-            None
+        let final_handle = match h {
+            Some(hd) => {
+                if self.no_open.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                    let handle_data = HandleData {
+                        node: Arc::clone(&node),
+                        //               childrens: None,
+                        offset: 0,
+                        real_handle: Some(RealHandle {
+                            real_inode: Arc::clone(&real_inode),
+                            handle: AtomicU64::new(hd),
+                            invalid: AtomicBool::new(false),
+                        }),
+                    };
+                    self.handles
+                        .lock()
+                        .unwrap()
+                        .insert(handle, Arc::new(handle_data));
+                    Some(handle)
+                }
+            }
+            None => None,
         };
 
         // return data
@@ -582,9 +615,7 @@ impl FileSystem for OverlayFs {
             _ => {}
         }
 
-        return Ok((entry, final_handle, opts));
-
-        //Err(Error::new(ErrorKind::Other, "Unknown error"))
+        return Ok((entry, final_handle, opts, None));
     }
 
     fn unlink(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<()> {
@@ -599,7 +630,7 @@ impl FileSystem for OverlayFs {
     fn read(
         &self,
         ctx: &Context,
-        _inode: Inode,
+        inode: Inode,
         handle: Handle,
         w: &mut dyn ZeroCopyWriter,
         size: u32,
@@ -609,15 +640,19 @@ impl FileSystem for OverlayFs {
     ) -> Result<usize> {
         trace!(
             "READ: inode: {}, handle: {}, size: {}, offset: {}, lock_owner: {:?}, flags: {}\n",
-            _inode,
+            inode,
             handle,
             size,
             offset,
             lock_owner,
             flags
         );
-        if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-            if let Some(ref hd) = v.real_handle {
+
+        let data = self.get_data(ctx, Some(handle), inode, flags)?;
+
+        match data.real_handle {
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            Some(ref hd) => {
                 let real_handle = hd.handle.load(Ordering::Relaxed);
                 let ri = Arc::clone(&hd.real_inode);
                 let (real_inode, layer) = (
@@ -628,7 +663,7 @@ impl FileSystem for OverlayFs {
                     })?),
                 );
 
-                return layer.fs().read(
+                return layer.read(
                     ctx,
                     real_inode,
                     real_handle,
@@ -640,14 +675,12 @@ impl FileSystem for OverlayFs {
                 );
             }
         }
-
-        Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
     fn write(
         &self,
         ctx: &Context,
-        _inode: Inode,
+        inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader,
         size: u32,
@@ -659,7 +692,7 @@ impl FileSystem for OverlayFs {
     ) -> Result<usize> {
         trace!(
             "WRITE: inode: {}, handle: {}, size: {}, offset: {}, lock_owner: {:?}, delayed_write: {}, flags: {}, fuse_flags: {}\n",
-            _inode,
+            inode,
             handle,
             size,
             offset,
@@ -668,8 +701,12 @@ impl FileSystem for OverlayFs {
             flags,
             fuse_flags
         );
-        if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-            if let Some(ref hd) = v.real_handle {
+
+        let data = self.get_data(ctx, Some(handle), inode, flags)?;
+
+        match data.real_handle {
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            Some(ref hd) => {
                 let real_handle = hd.handle.load(Ordering::Relaxed);
                 let ri = Arc::clone(&hd.real_inode);
                 let (real_inode, layer) = (
@@ -680,7 +717,7 @@ impl FileSystem for OverlayFs {
                     })?),
                 );
 
-                return layer.fs().write(
+                let result = layer.write(
                     ctx,
                     real_inode,
                     real_handle,
@@ -692,11 +729,10 @@ impl FileSystem for OverlayFs {
                     flags,
                     fuse_flags,
                 );
+                return result;
                 // remove whiteout node from child and inode hash
             }
         }
-
-        Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
     fn getattr(
@@ -705,9 +741,14 @@ impl FileSystem for OverlayFs {
         inode: Inode,
         handle: Option<Handle>,
     ) -> Result<(libc::stat64, Duration)> {
-        trace!("GETATTR: inode: {}\n", inode);
-        if let Some(h) = handle {
-            if let Some(hd) = self.handles.lock().unwrap().get(&h) {
+        trace!(
+            "GETATTR: inode: {}, handle: {}\n",
+            inode,
+            handle.unwrap_or_default()
+        );
+
+        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
+            if let Some(hd) = self.handles.lock().unwrap().get(&handle.unwrap()) {
                 if let Some(ref v) = hd.real_handle {
                     let ri = Arc::clone(&v.real_inode);
                     let layer = Arc::clone(ri.layer.as_ref().ok_or_else(|| {
@@ -716,20 +757,20 @@ impl FileSystem for OverlayFs {
                     })?);
                     let real_inode = ri.inode.load(Ordering::Relaxed);
                     let real_handle = v.handle.load(Ordering::Relaxed);
-                    let (st, _d) = layer.fs().getattr(ctx, real_inode, Some(real_handle))?;
+                    let (st, _d) = layer.getattr(ctx, real_inode, Some(real_handle))?;
                     return Ok((st, self.config.attr_timeout));
                 }
             }
-        } else {
-            let node = self.lookup_node(ctx, inode, "")?;
-            let rl = node.first_inode();
-            if let Some(ref v) = rl.layer {
-                let layer = Arc::clone(v);
-                let real_inode = rl.inode.load(Ordering::Relaxed);
+        }
 
-                let (st, _d) = layer.fs().getattr(ctx, real_inode, None)?;
-                return Ok((st, self.config.attr_timeout));
-            }
+        let node = self.lookup_node(ctx, inode, "")?;
+        let rl = node.first_inode();
+        if let Some(ref v) = rl.layer {
+            let layer = Arc::clone(v);
+            let real_inode = rl.inode.load(Ordering::Relaxed);
+
+            let (st, _d) = layer.getattr(ctx, real_inode, None)?;
+            return Ok((st, self.config.attr_timeout));
         }
 
         Err(Error::from_raw_os_error(libc::ENOENT))
@@ -744,12 +785,16 @@ impl FileSystem for OverlayFs {
         valid: SetattrValid,
     ) -> Result<(libc::stat64, Duration)> {
         trace!("SETATTR: inode: {}\n", inode);
-        // find out real inode and real handle, if the first
-        // layer id not upper layer copy it up
+
+        // Check if upper layer exists.
+        self.upper_layer
+            .as_ref()
+            .map(|v| v.clone())
+            .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
 
         // deal with handle first
-        if let Some(h) = handle {
-            if let Some(hd) = self.handles.lock().unwrap().get(&h) {
+        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
+            if let Some(hd) = self.handles.lock().unwrap().get(&handle.unwrap()) {
                 if let Some(ref rhd) = hd.real_handle {
                     let ri = Arc::clone(&rhd.real_inode);
                     let layer = Arc::clone(ri.layer.as_ref().ok_or_else(|| {
@@ -759,11 +804,9 @@ impl FileSystem for OverlayFs {
                     let real_inode = ri.inode.load(Ordering::Relaxed);
                     let real_handle = rhd.handle.load(Ordering::Relaxed);
                     // handle opened in upper layer
-                    if self.is_upper_layer(Arc::clone(&layer)) {
+                    if ri.in_upper_layer {
                         let (st, _d) =
-                            layer
-                                .fs()
-                                .setattr(ctx, real_inode, attr, Some(real_handle), valid)?;
+                            layer.setattr(ctx, real_inode, attr, Some(real_handle), valid)?;
 
                         return Ok((st, self.config.attr_timeout));
                     }
@@ -789,7 +832,7 @@ impl FileSystem for OverlayFs {
             v.inode.load(Ordering::Relaxed),
         );
 
-        let (st, _d) = layer.fs().setattr(ctx, real_inode, attr, None, valid)?;
+        let (st, _d) = layer.setattr(ctx, real_inode, attr, None, valid)?;
         Ok((st, self.config.attr_timeout))
     }
 
@@ -860,7 +903,7 @@ impl FileSystem for OverlayFs {
             })?;
             if node.in_upper_layer() {
                 // whiteout in upper layer, need to delete
-                first_layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
+                first_layer.delete_whiteout(ctx, real_parent_inode, name)?;
             }
 
             // delete inode from inodes and childrens
@@ -880,9 +923,7 @@ impl FileSystem for OverlayFs {
             error!("MKNOD: real inode layer is none");
             Error::from_raw_os_error(libc::EINVAL)
         })?);
-        layer
-            .fs()
-            .mknod(ctx, real_parent_inode, name, mode, rdev, umask)?;
+        layer.mknod(ctx, real_parent_inode, name, mode, rdev, umask)?;
 
         pnode.loaded.store(false, Ordering::Relaxed);
         let entry = self.do_lookup(ctx, parent, sname.as_str());
@@ -932,7 +973,7 @@ impl FileSystem for OverlayFs {
                     Error::from_raw_os_error(libc::EINVAL)
                 })?);
                 let real_parent_inode = pri.inode.load(Ordering::Relaxed);
-                layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
+                layer.delete_whiteout(ctx, real_parent_inode, name)?;
             }
 
             // delete from hash
@@ -948,7 +989,7 @@ impl FileSystem for OverlayFs {
         })?);
         let real_parent_inode = pri.inode.load(Ordering::Relaxed);
         let real_inode = node.first_inode().inode.load(Ordering::Relaxed);
-        layer.fs().link(ctx, real_inode, real_parent_inode, name)?;
+        layer.link(ctx, real_inode, real_parent_inode, name)?;
 
         newpnode.loaded.store(false, Ordering::Relaxed);
         let entry = self.do_lookup(ctx, newparent, sname.as_str());
@@ -1000,7 +1041,7 @@ impl FileSystem for OverlayFs {
             )
         };
 
-        layer.fs().symlink(ctx, linkname, real_parent, name)?;
+        layer.symlink(ctx, linkname, real_parent, name)?;
 
         pnode.loaded.store(false, Ordering::Relaxed);
         let entry = self.do_lookup(ctx, parent, sname.as_str());
@@ -1029,7 +1070,7 @@ impl FileSystem for OverlayFs {
             )
         };
 
-        layer.fs().readlink(ctx, real_inode)
+        layer.readlink(ctx, real_inode)
     }
 
     fn flush(&self, ctx: &Context, inode: Inode, handle: Handle, lock_owner: u64) -> Result<()> {
@@ -1039,6 +1080,10 @@ impl FileSystem for OverlayFs {
             handle,
             lock_owner
         );
+
+        if self.no_open.load(Ordering::Relaxed) {
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
 
         let node = self.lookup_node(ctx, inode, "")?;
 
@@ -1058,7 +1103,7 @@ impl FileSystem for OverlayFs {
 
         // FIXME: need to test if inode matches corresponding handle?
 
-        layer.fs().flush(ctx, real_inode, real_handle, lock_owner)
+        layer.flush(ctx, real_inode, real_handle, lock_owner)
     }
 
     fn fsync(&self, ctx: &Context, inode: Inode, datasync: bool, handle: Handle) -> Result<()> {
@@ -1068,23 +1113,8 @@ impl FileSystem for OverlayFs {
             datasync,
             handle
         );
-        let node = self.lookup_node(ctx, inode, "")?;
 
-        if node.whiteout.load(Ordering::Relaxed) {
-            return Err(Error::from_raw_os_error(libc::ENOENT));
-        }
-
-        if !self.node_in_upper_layer(Arc::clone(&node))? {
-            // in lower layer, error out or just success?
-            // FIXME:
-            return Err(Error::from_raw_os_error(libc::EROFS));
-        }
-
-        let (layer, real_inode, real_handle) = self.find_real_info_from_handle(ctx, handle)?;
-
-        // FIXME: need to test if inode matches corresponding handle?
-
-        layer.fs().fsync(ctx, real_inode, datasync, real_handle)
+        return self.do_fsync(ctx, inode, datasync, handle, false);
     }
 
     fn fsyncdir(&self, ctx: &Context, inode: Inode, datasync: bool, handle: Handle) -> Result<()> {
@@ -1095,23 +1125,7 @@ impl FileSystem for OverlayFs {
             handle
         );
 
-        let node = self.lookup_node(ctx, inode, "")?;
-
-        if node.whiteout.load(Ordering::Relaxed) {
-            return Err(Error::from_raw_os_error(libc::ENOENT));
-        }
-
-        if !self.node_in_upper_layer(Arc::clone(&node))? {
-            // in lower layer, error out or just success?
-            // FIXME:
-            return Err(Error::from_raw_os_error(libc::EROFS));
-        }
-
-        let (layer, real_inode, real_handle) = self.find_real_info_from_handle(ctx, handle)?;
-
-        // FIXME: need to test if inode matches corresponding handle?
-
-        layer.fs().fsyncdir(ctx, real_inode, datasync, real_handle)
+        return self.do_fsync(ctx, inode, datasync, handle, true);
     }
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> Result<()> {
@@ -1123,7 +1137,7 @@ impl FileSystem for OverlayFs {
         }
 
         let (layer, real_inode) = self.find_real_inode(ctx, inode)?;
-        layer.fs().access(ctx, real_inode, mask)
+        layer.access(ctx, real_inode, mask)
     }
 
     fn setxattr(
@@ -1157,7 +1171,7 @@ impl FileSystem for OverlayFs {
 
         let (layer, real_inode) = self.find_real_inode(ctx, inode)?;
 
-        layer.fs().setxattr(ctx, real_inode, name, value, flags)
+        layer.setxattr(ctx, real_inode, name, value, flags)
     }
 
     fn getxattr(
@@ -1181,7 +1195,7 @@ impl FileSystem for OverlayFs {
 
         let (layer, real_inode) = self.find_real_inode(ctx, inode)?;
 
-        layer.fs().getxattr(ctx, real_inode, name, size)
+        layer.getxattr(ctx, real_inode, name, size)
     }
 
     fn listxattr(&self, ctx: &Context, inode: Inode, size: u32) -> Result<ListxattrReply> {
@@ -1194,7 +1208,7 @@ impl FileSystem for OverlayFs {
 
         let (layer, real_inode) = self.find_real_inode(ctx, inode)?;
 
-        layer.fs().listxattr(ctx, real_inode, size)
+        layer.listxattr(ctx, real_inode, size)
     }
 
     fn removexattr(&self, ctx: &Context, inode: Inode, name: &CStr) -> Result<()> {
@@ -1219,7 +1233,7 @@ impl FileSystem for OverlayFs {
 
         let (layer, real_inode) = self.find_real_inode(ctx, inode)?;
 
-        layer.fs().removexattr(ctx, real_inode, name)
+        layer.removexattr(ctx, real_inode, name)
     }
 
     fn fallocate(
@@ -1239,25 +1253,30 @@ impl FileSystem for OverlayFs {
             offset,
             length
         );
-        let node = self.lookup_node(ctx, inode, "")?;
+        // Use O_RDONLY flags which indicates no copy up.
+        let data = self.get_data(ctx, Some(handle), inode, libc::O_RDONLY as u32)?;
 
-        if node.whiteout.load(Ordering::Relaxed) {
-            return Err(Error::from_raw_os_error(libc::ENOENT));
+        match data.real_handle {
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            Some(ref rhd) => {
+                let real_handle = rhd.handle.load(Ordering::Relaxed);
+                let ri = Arc::clone(&rhd.real_inode);
+                let layer = Arc::clone(ri.layer.as_ref().ok_or_else(|| {
+                    error!(
+                        "real inode {} has no layer",
+                        ri.inode.load(Ordering::Relaxed)
+                    );
+                    Error::from_raw_os_error(libc::EINVAL)
+                })?);
+
+                if !ri.in_upper_layer {
+                    // TODO: in lower layer, error out or just success?
+                    return Err(Error::from_raw_os_error(libc::EROFS));
+                }
+                let real_inode = ri.inode.load(Ordering::Relaxed);
+                return layer.fallocate(ctx, real_inode, real_handle, mode, offset, length);
+            }
         }
-
-        if !self.node_in_upper_layer(Arc::clone(&node))? {
-            // copy node into upper layer
-            // FIXME:
-            // only for node in upper layer, not in upper layer
-            // indicates open in readonly mode, and cannot fallocate
-            return Err(Error::from_raw_os_error(libc::EPERM));
-        }
-
-        let (layer, real_inode, real_handle) = self.find_real_info_from_handle(ctx, handle)?;
-
-        layer
-            .fs()
-            .fallocate(ctx, real_inode, real_handle, mode, offset, length)
     }
 
     fn lseek(
@@ -1290,33 +1309,6 @@ impl FileSystem for OverlayFs {
         }
 
         let (layer, real_inode, real_handle) = self.find_real_info_from_handle(ctx, handle)?;
-        layer
-            .fs()
-            .lseek(ctx, real_inode, real_handle, offset, whence)
+        layer.lseek(ctx, real_inode, real_handle, offset, whence)
     }
 }
-
-// impl BackendFileSystem for OverlayFs {
-//     fn mount(&self) -> Result<(Entry, u64)> {
-//         if let Some(ref root) = self.root.as_ref() {
-//             let ctx = Context::default();
-//             Ok((
-//                 Entry {
-//                     inode: root.inode,
-//                     generation: 0,
-//                     attr: root.stat64(&ctx)?,
-//                     attr_flags: 0,
-//                     attr_timeout: self.config.attr_timeout,
-//                     entry_timeout: self.config.entry_timeout,
-//                 },
-//                 VFS_MAX_INO,
-//             ))
-//         } else {
-//             Err(Error::new(ErrorKind::Other, "fs not inited"))
-//         }
-//     }
-
-//     fn as_any(&self) -> &dyn Any {
-//         self
-//     }
-// }

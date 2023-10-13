@@ -30,6 +30,9 @@ pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
 mod sync_io;
 pub use sync_io::FileSystem;
 
+mod overlay;
+pub use overlay::Layer;
+
 /// Information about a path in the filesystem.
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {

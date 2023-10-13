@@ -12,10 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use fuse_backend_rs::api::filesystem::Layer;
 use fuse_backend_rs::api::server::Server;
-//use fuse_backend_rs::api::{Vfs, VfsOptions};
 use fuse_backend_rs::overlayfs::config::Config;
-use fuse_backend_rs::overlayfs::{layer::Layer, OverlayFs};
+use fuse_backend_rs::overlayfs::OverlayFs;
 use fuse_backend_rs::passthrough::{self, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::LevelFilter;
@@ -36,7 +36,9 @@ pub struct FuseServer {
     ch: FuseChannel,
 }
 
-fn new_passthroughfs_layer(rootdir: &str, is_upper: bool) -> Result<Layer> {
+type BoxedLayer = Box<dyn Layer<Inode = u64, Handle = u64> + Send + Sync>;
+
+fn new_passthroughfs_layer(rootdir: &str) -> Result<BoxedLayer> {
     let mut config = passthrough::Config::default();
     config.root_dir = String::from(rootdir);
     // enable xattr
@@ -44,7 +46,7 @@ fn new_passthroughfs_layer(rootdir: &str, is_upper: bool) -> Result<Layer> {
     config.do_import = true;
     let fs = Box::new(PassthroughFs::<()>::new(config)?);
     fs.import()?;
-    Ok(Layer::new(fs, is_upper))
+    Ok(fs as BoxedLayer)
 }
 
 fn help() {
@@ -113,17 +115,17 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     SimpleLogger::new()
-        .with_level(LevelFilter::Debug)
+        .with_level(LevelFilter::Trace)
         .init()
         .unwrap();
     let args = parse_args()?;
     println!("args: {:?}", args);
 
     // let basedir = "/home/zhangwei/program/test-overlay/test2/";
-    let upper_layer = Arc::new(Box::new(new_passthroughfs_layer(&args.upperdir, true)?));
+    let upper_layer = Arc::new(new_passthroughfs_layer(&args.upperdir)?);
     let mut lower_layers = Vec::new();
     for lower in args.lowerdir {
-        lower_layers.push(Arc::new(Box::new(new_passthroughfs_layer(&lower, false)?)));
+        lower_layers.push(Arc::new(new_passthroughfs_layer(&lower)?));
     }
 
     let mut config = Config::default();

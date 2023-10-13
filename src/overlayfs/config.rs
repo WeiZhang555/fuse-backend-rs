@@ -4,18 +4,17 @@ use std::time::Duration;
 
 #[derive(Default, Clone, Debug)]
 pub struct Config {
-    pub upper: String,
-    pub lower: Vec<String>,
-    pub work: String,
     pub mountpoint: String,
+    pub work: String,
     pub do_import: bool,
+    // Filesystem options.
     pub writeback: bool,
     pub no_open: bool,
     pub no_opendir: bool,
     pub killpriv_v2: bool,
     pub no_readdir: bool,
-    pub xattr: bool,
-    pub xattr_permissions: bool,
+    // pub xattr: bool,
+    // pub xattr_permissions: bool,
     pub perfile_dax: bool,
     pub cache_policy: CachePolicy,
     pub attr_timeout: Duration,
