@@ -63,6 +63,7 @@ impl<F: FileSystem + Sync> Server<F> {
     /// invokes filesystem drivers to server the requests, and eventually send back the result to
     /// the transport layer.
     #[allow(unused_variables)]
+    #[allow(unused_must_use)]
     pub fn handle_message<S: BitmapSlice>(
         &self,
         mut r: Reader<'_, S>,

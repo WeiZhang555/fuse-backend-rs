@@ -1,5 +1,7 @@
-#![allow(missing_docs)]
+// Copyright (C) 2023 Ant Group. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
+#![allow(missing_docs)]
 pub mod config;
 pub mod sync_io;
 mod utils;
@@ -8,19 +10,20 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Result, Seek, SeekFrom};
-use std::mem::MaybeUninit;
-use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::abi::fuse_abi::{CreateIn, ROOT_ID as FUSE_ROOT_ID};
+use crate::abi::fuse_abi::{ino64_t, stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
 use crate::api::filesystem::{
     Context, DirEntry, Entry, Layer, OpenOptions, ZeroCopyReader, ZeroCopyWriter,
 };
-use crate::api::{BackendFileSystem, SLASH_ASCII, VFS_MAX_INO};
+#[cfg(not(feature = "async-io"))]
+use crate::api::BackendFileSystem;
+use crate::api::{SLASH_ASCII, VFS_MAX_INO};
 
 use crate::common::file_buf::FileVolatileSlice;
 use crate::common::file_traits::FileReadWriteVolatile;
+use vmm_sys_util::tempfile::TempFile;
 
 use self::config::Config;
 use std::io::{Error, ErrorKind};
@@ -59,7 +62,7 @@ pub struct RealInodeStats {
     pub inode: u64,
     pub whiteout: bool,
     pub opaque: bool,
-    pub stat: Option<libc::stat64>,
+    pub stat: Option<stat64>,
 }
 
 #[derive(Default)]
@@ -73,7 +76,7 @@ pub struct OverlayInode {
     pub upper_inode: Mutex<Option<Arc<RealInode>>>,
     // Inode number.
     pub inode: u64,
-    pub st_ino: libc::ino64_t,
+    pub st_ino: ino64_t,
     pub st_dev: libc::dev_t,
     pub mode: libc::mode_t,
     pub entry_type: u32,
@@ -88,8 +91,10 @@ pub struct OverlayInode {
     // put it into layer struct, ino -> private data hash
 }
 
+#[derive(Default)]
 pub enum CachePolicy {
     Never,
+    #[default]
     Auto,
     Always,
 }
@@ -130,7 +135,7 @@ pub struct HandleData {
 }
 
 impl RealInode {
-    pub fn stat64_ignore_enoent(&self, ctx: &Context) -> Result<Option<libc::stat64>> {
+    pub fn stat64_ignore_enoent(&self, ctx: &Context) -> Result<Option<stat64>> {
         if self.invalid.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -140,9 +145,7 @@ impl RealInode {
             .ok_or(Error::from_raw_os_error(libc::EINVAL))?
             .getattr(ctx, self.inode.load(Ordering::Relaxed), None)
         {
-            Ok((v1, _v2)) => {
-                return Ok(Some(v1));
-            }
+            Ok((v1, _v2)) => Ok(Some(v1)),
 
             Err(e) => match e.raw_os_error() {
                 Some(raw_error) => {
@@ -152,12 +155,9 @@ impl RealInode {
                     {
                         return Ok(None);
                     }
-                    return Err(e);
+                    Err(e)
                 }
-
-                None => {
-                    return Err(e);
-                }
+                None => Err(e),
             },
         }
     }
@@ -183,8 +183,7 @@ impl RealInode {
                 if v.inode == 0 {
                     return Ok(None);
                 }
-                //layer.forget(ctx, v.inode, 1);
-                return Ok(Some(v));
+                Ok(Some(v))
             }
             Err(e) => {
                 if let Some(raw_error) = e.raw_os_error() {
@@ -193,7 +192,7 @@ impl RealInode {
                     }
                 }
 
-                return Err(e);
+                Err(e)
             }
         }
     }
@@ -256,7 +255,7 @@ impl OverlayInode {
         OverlayInode::default()
     }
 
-    pub fn stat64(&self, ctx: &Context) -> Result<libc::stat64> {
+    pub fn stat64(&self, ctx: &Context) -> Result<stat64> {
         // try upper layer if there is
         if let Some(ref l) = *self.upper_inode.lock().unwrap() {
             if let Some(v) = l.stat64_ignore_enoent(ctx)? {
@@ -317,7 +316,7 @@ impl OverlayInode {
     }
 
     pub fn upper_layer_only(&self) -> bool {
-        self.lower_inodes.len() == 0
+        self.lower_inodes.is_empty()
     }
 
     pub fn first_inode(&self) -> Arc<RealInode> {
@@ -339,7 +338,7 @@ impl OverlayInode {
                 Error::from_raw_os_error(libc::EINVAL)
             }) {
                 Ok(l) => Some((Arc::clone(v), Arc::clone(l))),
-                Err(_) => return None,
+                Err(_) => None,
             },
             None => None,
         }
@@ -499,11 +498,7 @@ impl OverlayFs {
     }
 
     fn inode_get(&self, inode: u64) -> Option<Arc<OverlayInode>> {
-        self.inodes
-            .lock()
-            .unwrap()
-            .get(&inode)
-            .map(|v| Arc::clone(v))
+        self.inodes.lock().unwrap().get(&inode).cloned()
     }
 
     fn inode_remove(&self, inode: u64) -> Option<Arc<OverlayInode>> {
@@ -518,7 +513,7 @@ impl OverlayFs {
         parent: Inode,
         name: &str,
     ) -> Result<Arc<OverlayInode>> {
-        if name.contains(&[SLASH_ASCII as char]) {
+        if name.contains([SLASH_ASCII as char]) {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
@@ -648,7 +643,7 @@ impl OverlayFs {
             new.parent = Mutex::new(Arc::downgrade(&pnode));
             // insert node into hashs
             let new_node = Arc::new(new);
-            self.inode_add(new_node.inode as u64, Arc::clone(&new_node));
+            self.inode_add(new_node.inode, Arc::clone(&new_node));
             pnode
                 .childrens
                 .lock()
@@ -668,17 +663,14 @@ impl OverlayFs {
         name: &str,
     ) -> Result<Option<Arc<OverlayInode>>> {
         match self.lookup_node(ctx, parent, name) {
-            Ok(n) => {
-                return Ok(Some(Arc::clone(&n)));
-            }
-
+            Ok(n) => Ok(Some(Arc::clone(&n))),
             Err(e) => {
                 if let Some(raw_error) = e.raw_os_error() {
                     if raw_error == libc::ENOENT {
                         return Ok(None);
                     }
                 }
-                return Err(e);
+                Err(e)
             }
         }
     }
@@ -688,7 +680,7 @@ impl OverlayFs {
             return Some(v);
         }
 
-        return None;
+        None
     }
 
     // Load directory entries from one specific layer, layer can be upper or some one of lower layers.
@@ -798,13 +790,7 @@ impl OverlayFs {
     }
 
     pub fn load_directory(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<()> {
-        let tmp_ui = {
-            if let Some(ref v) = *node.upper_inode.lock().unwrap() {
-                Some(Arc::clone(v))
-            } else {
-                None
-            }
-        };
+        let tmp_ui = node.upper_inode.lock().unwrap().as_ref().cloned();
 
         if let Some(ref ui) = tmp_ui {
             debug!("load upper for '{}'", node.path.as_str());
@@ -886,7 +872,7 @@ impl OverlayFs {
     }
 
     pub fn get_first_lower_layer(&self) -> Option<Arc<BoxedLayer>> {
-        if self.lower_layers.len() > 0 {
+        if !self.lower_layers.is_empty() {
             Some(Arc::clone(&self.lower_layers[0]))
         } else {
             None
@@ -945,7 +931,7 @@ impl OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
-        if let None = self.get_node_from_inode(parent) {
+        if self.get_node_from_inode(parent).is_none() {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         };
 
@@ -961,55 +947,39 @@ impl OverlayFs {
         node.lookups.fetch_add(1, Ordering::Relaxed);
 
         Ok(Entry {
-            inode: node.inode as u64,
+            inode: node.inode,
             generation: 0,
-            attr: st, //libc::stat64
+            attr: st,
             attr_flags: 0,
             attr_timeout: self.config.attr_timeout,
             entry_timeout: self.config.entry_timeout,
         })
     }
 
-    pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
-        if let Some(ovl) = self.inode_get(inode) {
-            // Find upper layer.
-            let real_inode = ovl
-                .upper_inode
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|ri| Some(ri.clone()))
-                .or_else(|| {
-                    if ovl.lower_inodes.len() > 0 {
-                        Some(Arc::clone(&ovl.lower_inodes[0]))
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| Error::new(ErrorKind::Other, "backend inode not found"))?;
-
-            let layer = real_inode
-                .layer
-                .as_ref()
-                .ok_or_else(|| Error::new(ErrorKind::Other, "layer not found for real inode"))?;
-            if let Ok(sfs) = layer.statfs(ctx, real_inode.inode.load(Ordering::Relaxed)) {
-                return Ok(sfs);
+    pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<statvfs64> {
+        match self.inode_get(inode) {
+            Some(ovl) => {
+                // Find upper layer.
+                let real_inode = ovl
+                    .upper_inode
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| {
+                        if !ovl.lower_inodes.is_empty() {
+                            Some(Arc::clone(&ovl.lower_inodes[0]))
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| Error::new(ErrorKind::Other, "backend inode not found"))?;
+                let layer = real_inode.layer.as_ref().ok_or_else(|| {
+                    Error::new(ErrorKind::Other, "layer not found for real inode")
+                })?;
+                layer.statfs(ctx, real_inode.inode.load(Ordering::Relaxed))
             }
-        }
-        // otherwise stat on mountpoint
-        let mut sfs = MaybeUninit::<libc::statvfs64>::zeroed();
-        // FIXME: mountpoint may not exists at all. @fangcun.zw
-        let cpath = utils::to_cstring(self.config.mountpoint.as_str())?;
-        let path = cpath.as_c_str().as_ptr();
-
-        debug!("stat mountpoint path: {:?}", cpath.to_str());
-        match unsafe { libc::statvfs64(path, sfs.as_mut_ptr()) } {
-            0 => {
-                let sfs = unsafe { sfs.assume_init() };
-                Ok(sfs)
-            }
-
-            _ => Err(Error::last_os_error()),
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
         }
     }
 
@@ -1020,6 +990,7 @@ impl OverlayFs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn do_readdir(
         &self,
         ctx: &Context,
@@ -1095,8 +1066,7 @@ impl OverlayFs {
             return Ok(());
         }
 
-        let mut index: u64 = 0;
-        for (name, child) in childrens {
+        for (index, (name, child)) in (0_u64..).zip(childrens.into_iter()) {
             if index >= offset {
                 // make struct DireEntry and Entry
                 let st = child.stat64(ctx)?;
@@ -1140,8 +1110,6 @@ impl OverlayFs {
                     }
                 }
             }
-
-            index += 1;
         }
 
         Ok(())
@@ -1204,9 +1172,9 @@ impl OverlayFs {
                 .unwrap()
                 .replace(Arc::clone(&real_inode));
 
-            return Ok(());
+            Ok(())
         } else {
-            return self.create_node_directory(ctx, Arc::clone(&pnode));
+            self.create_node_directory(ctx, Arc::clone(&pnode))
         }
     }
 
@@ -1222,7 +1190,7 @@ impl OverlayFs {
         let upper = self
             .upper_layer
             .as_ref()
-            .map(|v| v.clone())
+            .cloned()
             .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
 
         let pnode = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
@@ -1275,7 +1243,7 @@ impl OverlayFs {
         // update first_inode() and upper_inode
         *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
 
-        return Ok(Arc::clone(&node));
+        Ok(Arc::clone(&node))
     }
 
     pub fn copy_regfile_up(
@@ -1289,7 +1257,7 @@ impl OverlayFs {
         let upper = self
             .upper_layer
             .as_ref()
-            .map(|v| v.clone())
+            .cloned()
             .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
 
         let pnode = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
@@ -1368,17 +1336,19 @@ impl OverlayFs {
         // need to impl ZeroCopyReader/ZeroCopyWriter, somehow like a pipe..
         // stupid: to create a temp file for now..
         // FIXME: need to copy xattr, futimes, set origin.TODO
+        // FIXME: use workdir as temporary storage instead of local tmpfs.
 
-        let template = utils::to_cstring("/tmp/fuse-overlay-XXXXXX")?;
-        let template = template.into_raw();
-        let flags = libc::O_RDWR | libc::O_CREAT;
-        let fd = unsafe { libc::mkostemp(template, flags) };
+        // let template = utils::to_cstring("/tmp/fuse-overlay-XXXXXX")?;
+        // let template = template.into_raw();
+        // let flags = libc::O_RDWR | libc::O_CREAT;
+        // let fd = unsafe { libc::mkostemp(template, flags) };
 
-        if fd < 0 {
-            return Err(Error::last_os_error());
-        }
+        // if fd < 0 {
+        //     return Err(Error::last_os_error());
+        // }
+        //let mut file = unsafe { File::from_raw_fd(fd) };
 
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = TempFile::new().unwrap().into_file();
         let mut offset: usize = 0;
         let size = 4 * 1024 * 1024;
         loop {
@@ -1422,9 +1392,9 @@ impl OverlayFs {
         }
 
         drop(file);
-        unsafe {
-            libc::unlink(template);
-        }
+        // unsafe {
+        //     libc::unlink(template);
+        // }
 
         // close handles
         layer.release(
@@ -1441,7 +1411,7 @@ impl OverlayFs {
         // update upper_inode and first_inode()
         *node.upper_inode.lock().unwrap() = Some(Arc::clone(&real_inode));
 
-        return Ok(Arc::clone(&node));
+        Ok(Arc::clone(&node))
     }
 
     pub fn copy_node_up(
@@ -1513,10 +1483,8 @@ impl OverlayFs {
             }
 
             // need to delete whiteouts?
-            if whiteouts > 0 {
-                if node.in_upper_layer() {
-                    self.empty_node_directory(ctx, Arc::clone(&node))?;
-                }
+            if whiteouts > 0 && node.in_upper_layer() {
+                self.empty_node_directory(ctx, Arc::clone(&node))?;
             }
 
             trace!("whiteouts deleted!\n");
@@ -1605,9 +1573,9 @@ impl OverlayFs {
                 }
                 let real_inode = ri.inode.load(Ordering::Relaxed);
                 if syncdir {
-                    return layer.fsyncdir(ctx, real_inode, datasync, real_handle);
+                    layer.fsyncdir(ctx, real_inode, datasync, real_handle)
                 } else {
-                    return layer.fsync(ctx, real_inode, datasync, real_handle);
+                    layer.fsync(ctx, real_inode, datasync, real_handle)
                 }
             }
         }
@@ -1782,10 +1750,12 @@ impl OverlayFs {
         flags: u32,
     ) -> Result<Arc<HandleData>> {
         let no_open = self.no_open.load(Ordering::Relaxed);
-        if !no_open && handle.is_some() {
-            if let Some(v) = self.handles.lock().unwrap().get(&handle.unwrap()) {
-                if v.node.inode == inode {
-                    return Ok(Arc::clone(v));
+        if !no_open {
+            if let Some(h) = handle {
+                if let Some(v) = self.handles.lock().unwrap().get(&h) {
+                    if v.node.inode == inode {
+                        return Ok(Arc::clone(v));
+                    }
                 }
             }
         } else {
@@ -1806,7 +1776,7 @@ impl OverlayFs {
                 // Check if upper layer exists, return EROFS is not exists.
                 self.upper_layer
                     .as_ref()
-                    .map(|v| v.clone())
+                    .cloned()
                     .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
                 // copy up to upper layer
                 self.copy_node_up(ctx, Arc::clone(&node))?;
@@ -1829,7 +1799,7 @@ impl OverlayFs {
             //}
         }
 
-        return Err(Error::from_raw_os_error(libc::ENOENT));
+        Err(Error::from_raw_os_error(libc::ENOENT))
     }
 }
 
@@ -1840,10 +1810,7 @@ impl ZeroCopyReader for File {
         count: usize,
         off: u64,
     ) -> Result<usize> {
-        let mut buf = Vec::<u8>::with_capacity(count);
-        unsafe {
-            buf.set_len(count);
-        }
+        let mut buf = vec![0_u8; count];
         let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
 
         let ret = f.read_at_volatile(slice, off)?;
@@ -1863,10 +1830,7 @@ impl ZeroCopyWriter for File {
         count: usize,
         off: u64,
     ) -> Result<usize> {
-        let mut buf = Vec::<u8>::with_capacity(count);
-        unsafe {
-            buf.set_len(count);
-        }
+        let mut buf = vec![0_u8; count];
         let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
         let ret = f.read_at_volatile(slice, off)?;
 
@@ -1883,6 +1847,7 @@ impl ZeroCopyWriter for File {
     }
 }
 
+#[cfg(not(feature = "async-io"))]
 impl BackendFileSystem for OverlayFs {
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.

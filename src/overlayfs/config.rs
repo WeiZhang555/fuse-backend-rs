@@ -1,3 +1,6 @@
+// Copyright (C) 2023 Ant Group. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use self::super::CachePolicy;
 use std::fmt;
 use std::time::Duration;
@@ -19,12 +22,6 @@ pub struct Config {
     pub cache_policy: CachePolicy,
     pub attr_timeout: Duration,
     pub entry_timeout: Duration,
-}
-
-impl Default for CachePolicy {
-    fn default() -> Self {
-        CachePolicy::Auto
-    }
 }
 
 impl Clone for CachePolicy {

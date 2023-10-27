@@ -1,3 +1,6 @@
+// Copyright (C) 2023 Ant Group. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::abi::fuse_abi::stat64;
 use std::ffi::CString;
 use std::io::{self, Error, Result};

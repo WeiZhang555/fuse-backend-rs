@@ -4,9 +4,9 @@
 
 #![allow(missing_docs)]
 
-use std::ffi::{CStr, CString};
-use std::io::{Error, Result, ErrorKind};
 use crate::abi::fuse_abi::stat64;
+use std::ffi::{CStr, CString};
+use std::io::{Error, ErrorKind, Result};
 
 use super::{Context, Entry, FileSystem, GetxattrReply};
 
@@ -103,13 +103,7 @@ pub trait Layer: FileSystem {
     fn set_opaque(&self, ctx: &Context, inode: Self::Inode) -> Result<()> {
         // A directory is made opaque by setting the xattr "trusted.overlay.opaque" to "y".
         // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
-        self.setxattr(
-            ctx,
-            inode,
-            to_cstring(OPAQUE_XATTR)?.as_c_str(),
-            b"y",
-            0,
-        )
+        self.setxattr(ctx, inode, to_cstring(OPAQUE_XATTR)?.as_c_str(), b"y", 0)
     }
 
     // Check if the directory is opaque.
@@ -137,7 +131,7 @@ pub trait Layer: FileSystem {
                             }
                         }
                         // no value found, go on to next check.
-                        return Ok((false, false));
+                        Ok((false, false))
                     }
                     Err(e) => {
                         if let Some(raw_error) = e.raw_os_error() {
@@ -153,7 +147,7 @@ pub trait Layer: FileSystem {
                             }
                         }
 
-                        return Err(e);
+                        Err(e)
                     }
                 }
             };
