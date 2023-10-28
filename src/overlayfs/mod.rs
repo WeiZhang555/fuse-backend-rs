@@ -105,7 +105,10 @@ pub struct OverlayFs {
     pub upper_layer: Option<Arc<BoxedLayer>>,
     // inode management..
     pub root: Option<Arc<OverlayInode>>,
+    // Active inodes.
     pub inodes: Mutex<HashMap<u64, Arc<OverlayInode>>>,
+    // Deleted inodes are unlinked inodes with non zero lookup count.
+    pub deleted_inodes: Mutex<HashMap<u64, Arc<OverlayInode>>>,
     pub next_inode: AtomicU64,
 
     // manage opened fds.
@@ -285,7 +288,7 @@ impl OverlayInode {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        for (_, child) in self.childrens.lock().unwrap().iter() {
+        for (_, child) in self.childrens() {
             if child.whiteout.load(Ordering::Relaxed) {
                 whiteouts += 1;
             } else {
@@ -347,6 +350,25 @@ impl OverlayInode {
     pub fn childrens(&self) -> HashMap<String, Arc<OverlayInode>> {
         self.childrens.lock().unwrap().clone()
     }
+
+    pub fn child(&self, name: &str) -> Option<Arc<OverlayInode>> {
+        self.childrens.lock().unwrap().get(name).cloned()
+    }
+
+    pub fn remove_child(&self, name: &str) {
+        self.childrens.lock().unwrap().remove(name);
+    }
+
+    pub fn insert_child(&self, name: &str, node: Arc<OverlayInode>) {
+        self.childrens
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), node);
+    }
+
+    pub fn clear_childrens(&self) {
+        self.childrens.lock().unwrap().clear();
+    }
 }
 
 fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
@@ -374,6 +396,7 @@ impl OverlayFs {
             lower_layers: lowers,
             upper_layer: upper,
             inodes: Mutex::new(HashMap::new()),
+            deleted_inodes: Mutex::new(HashMap::new()),
             root: None,
             next_inode: AtomicU64::new(FUSE_ROOT_ID + 1),
             handles: Mutex::new(HashMap::new()),
@@ -435,7 +458,7 @@ impl OverlayFs {
         let root_node = Arc::new(root);
 
         // insert root inode into hash
-        self.inode_add(root_node.inode, Arc::clone(&root_node));
+        self.insert_inode(root_node.inode, Arc::clone(&root_node));
 
         info!("loading root directory\n");
         self.load_directory(&ctx, Arc::clone(&root_node))?;
@@ -493,16 +516,82 @@ impl OverlayFs {
         Ok(new)
     }
 
-    fn inode_add(&self, inode: u64, node: Arc<OverlayInode>) {
+    fn insert_inode(&self, inode: u64, node: Arc<OverlayInode>) {
         self.inodes.lock().unwrap().insert(inode, node);
     }
 
-    fn inode_get(&self, inode: u64) -> Option<Arc<OverlayInode>> {
+    fn get_inode(&self, inode: u64) -> Option<Arc<OverlayInode>> {
         self.inodes.lock().unwrap().get(&inode).cloned()
     }
 
-    fn inode_remove(&self, inode: u64) -> Option<Arc<OverlayInode>> {
-        self.inodes.lock().unwrap().remove(&inode)
+    fn get_deleted_inode(&self, inode: u64) -> Option<Arc<OverlayInode>> {
+        self.deleted_inodes.lock().unwrap().get(&inode).cloned()
+    }
+
+    // Return 'totally' deleted inodes from both self.inodes and self.deleted_inodes.
+    fn remove_inode(&self, inode: u64) -> Option<Arc<OverlayInode>> {
+        let removed = match self.inodes.lock().unwrap().remove(&inode) {
+            Some(v) => {
+                // Refcount is not 0, we have to delay the removal.
+                if v.lookups.load(Ordering::Relaxed) > 0 {
+                    self.deleted_inodes.lock().unwrap().insert(inode, v.clone());
+                    return None;
+                }
+                Some(v)
+            }
+            None => {
+                // If the inode is not in hash, it must be in deleted_inodes.
+                let mut all_deleted = self.deleted_inodes.lock().unwrap();
+                match all_deleted.get(&inode) {
+                    Some(v) => {
+                        // Refcount is 0, the inode can be removed now.
+                        if v.lookups.load(Ordering::Relaxed) == 0 {
+                            all_deleted.remove(&inode)
+                        } else {
+                            // Refcount is not 0, the inode will be removed later.
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
+
+        // Call forget to release inodes for every layer.
+        let ctx = Context::default();
+        if let Some(v) = removed.clone().as_ref() {
+            for ri in &v.lower_inodes {
+                let layer = match ri.layer.as_ref() {
+                    Some(l) => l,
+                    None => {
+                        error!(
+                            "no lower layer for inode {}",
+                            ri.inode.load(Ordering::Relaxed)
+                        );
+                        return removed;
+                    }
+                };
+                // FIXME: find what is exact number instead of max_u64 to pass here. @fangcun.zw
+                layer.forget(&ctx, ri.inode.load(Ordering::Relaxed), u64::MAX);
+            }
+
+            if let Some(ri) = v.upper_inode.lock().unwrap().as_ref() {
+                let layer = match ri.layer.as_ref() {
+                    Some(l) => l,
+                    None => {
+                        error!(
+                            "no upper layer for inode {}",
+                            ri.inode.load(Ordering::Relaxed)
+                        );
+                        return removed;
+                    }
+                };
+                // FIXME: find what is exact number instead of max_u64 to pass here. @fangcun.zw
+                layer.forget(&ctx, ri.inode.load(Ordering::Relaxed), u64::MAX);
+            }
+        }
+
+        removed
     }
 
     // Lookup child OverlayInode with <name> under <parent> directory.
@@ -518,7 +607,7 @@ impl OverlayFs {
         }
 
         // Parent inode is expected to be loaded before this function is called.
-        let pnode = match self.inode_get(parent) {
+        let pnode = match self.get_inode(parent) {
             Some(v) => v,
             // No parent inode indicates an internal bug.
             None => return Err(Error::from_raw_os_error(libc::EINVAL)),
@@ -540,8 +629,8 @@ impl OverlayFs {
         }
 
         // Child is found.
-        if let Some(v) = pnode.childrens.lock().unwrap().get(name) {
-            return Ok(Arc::clone(v));
+        if let Some(v) = pnode.child(name) {
+            return Ok(v);
         }
 
         // If the directory is already loaded, return ENOENT directly.
@@ -643,7 +732,7 @@ impl OverlayFs {
             new.parent = Mutex::new(Arc::downgrade(&pnode));
             // insert node into hashs
             let new_node = Arc::new(new);
-            self.inode_add(new_node.inode, Arc::clone(&new_node));
+            self.insert_inode(new_node.inode, Arc::clone(&new_node));
             pnode
                 .childrens
                 .lock()
@@ -654,6 +743,18 @@ impl OverlayFs {
 
         // return specific errors?
         Err(Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    // As a debug function, print all inode numbers in hash table.
+    fn debug_print_all_inodes(&self) {
+        let inodes = self.inodes.lock().unwrap();
+        // Convert the HashMap to Vector<(inode, pathname)>
+        let mut all_inodes = inodes
+            .iter()
+            .map(|(inode, ovi)| (inode, ovi.path.clone(), ovi.lookups.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>();
+        all_inodes.sort_by(|a, b| a.0.cmp(b.0));
+        trace!("all inodes: {:?}", all_inodes);
     }
 
     pub fn lookup_node_ignore_enoent(
@@ -676,7 +777,7 @@ impl OverlayFs {
     }
 
     pub fn get_node_from_inode(&self, inode: u64) -> Option<Arc<OverlayInode>> {
-        if let Some(v) = self.inode_get(inode) {
+        if let Some(v) = self.get_inode(inode) {
             return Some(v);
         }
 
@@ -863,11 +964,8 @@ impl OverlayFs {
         if node.loaded.load(Ordering::Relaxed) {
             return Ok(());
         }
-        {
-            let mut children = node.childrens.lock().unwrap();
-            *children = HashMap::new();
-        }
 
+        node.clear_childrens();
         self.load_directory(ctx, node)
     }
 
@@ -892,14 +990,18 @@ impl OverlayFs {
             return;
         }
 
-        let v = {
-            if let Some(n) = self.inode_get(inode) {
-                n
-            } else {
-                return;
-            }
+        let v = match self.get_inode(inode) {
+            Some(n) => n,
+            None => match self.get_deleted_inode(inode) {
+                Some(n) => n,
+                None => {
+                    trace!("forget unknown inode: {}", inode);
+                    return;
+                }
+            },
         };
         // lock up lookups
+        // TODO: need atomic protection around lookups' load & store. @fangcun.zw
         let mut lookups = v.lookups.load(Ordering::Relaxed);
 
         if lookups < count {
@@ -911,12 +1013,12 @@ impl OverlayFs {
 
         if lookups == 0 {
             debug!("inode is forgotten: {}, name {}", inode, v.name);
-            let _ = self.inode_remove(inode);
+            let _ = self.remove_inode(inode);
             let parent = v.parent.lock().unwrap();
 
             if let Some(p) = parent.upgrade() {
                 // remove it from hashmap
-                p.childrens.lock().unwrap().remove(v.name.as_str());
+                p.remove_child(v.name.as_str());
                 p.loaded.store(true, Ordering::Relaxed);
             }
         }
@@ -944,8 +1046,8 @@ impl OverlayFs {
         }
 
         // FIXME: can forget happen between found and increase reference counter?
-        node.lookups.fetch_add(1, Ordering::Relaxed);
-
+        let tmp = node.lookups.fetch_add(1, Ordering::Relaxed);
+        trace!("lookup count: {}", tmp + 1);
         Ok(Entry {
             inode: node.inode,
             generation: 0,
@@ -957,7 +1059,7 @@ impl OverlayFs {
     }
 
     pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<statvfs64> {
-        match self.inode_get(inode) {
+        match self.get_inode(inode) {
             Some(ovl) => {
                 // Find upper layer.
                 let real_inode = ovl
@@ -1053,7 +1155,7 @@ impl OverlayFs {
         };
         childrens.push(("..".to_string(), parent_node));
 
-        for (_, child) in ovl_inode.childrens.lock().unwrap().iter() {
+        for (_, child) in ovl_inode.childrens() {
             // skip whiteout node
             if child.whiteout.load(Ordering::Relaxed) || child.hidden.load(Ordering::Relaxed) {
                 continue;
@@ -1523,10 +1625,11 @@ impl OverlayFs {
 
         trace!("toggling children and inodes hash\n");
 
-        {
-            pnode.childrens.lock().unwrap().remove(node.name.as_str());
-            self.inodes.lock().unwrap().remove(&node.inode);
-        }
+        // Since node has initial lookup count 1, we have to decrease it by 1 after file removal.
+        self.forget_one(node.inode, 1);
+        // remove it from hashmap
+        pnode.remove_child(node.name.as_str());
+        self.remove_inode(node.inode);
 
         let sname = name.to_string_lossy().into_owned().to_owned();
 
@@ -1643,12 +1746,9 @@ impl OverlayFs {
                     }
                 }
 
-                // Keep "{}" for dropping lock.
-                {
-                    // delete the child
-                    self.inodes.lock().unwrap().remove(&child.inode);
-                    node.childrens.lock().unwrap().remove(child.name.as_str());
-                }
+                // delete the child
+                self.remove_inode(child.inode);
+                node.remove_child(child.name.as_str());
             }
         }
 
@@ -1690,8 +1790,9 @@ impl OverlayFs {
             real_parent,
             utils::to_cstring(node.name.as_str())?.as_c_str(),
         )?;
-        self.inodes.lock().unwrap().remove(&node.inode);
-        pnode.childrens.lock().unwrap().remove(node.name.as_str());
+
+        self.remove_inode(node.inode);
+        pnode.remove_child(node.name.as_str());
 
         Ok(())
     }

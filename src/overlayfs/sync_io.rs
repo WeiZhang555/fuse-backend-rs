@@ -78,12 +78,18 @@ impl FileSystem for OverlayFs {
     fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<Entry> {
         let tmp = name.to_string_lossy().to_string();
         trace!("LOOKUP: parent: {}, name: {}\n", parent, tmp);
-        self.do_lookup(ctx, parent, tmp.as_str())
+        let result = self.do_lookup(ctx, parent, tmp.as_str());
+        if result.is_ok() {
+            trace!("LOOKUP result: {:?}", result.as_ref().unwrap());
+        }
+        self.debug_print_all_inodes();
+        result
     }
 
     fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
         trace!("FORGET: inode: {}, count: {}\n", inode, count);
-        self.forget_one(inode, count)
+        self.forget_one(inode, count);
+        self.debug_print_all_inodes();
     }
 
     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Inode, u64)>) {
@@ -270,8 +276,8 @@ impl FileSystem for OverlayFs {
         // remove whiteout node from child and inode hash
         // FIXME: maybe a reload from start better
         if has_whiteout {
-            pnode.childrens.lock().unwrap().remove(sname.as_str());
-            self.inodes.lock().unwrap().remove(&node.inode);
+            pnode.remove_child(sname.as_str());
+            self.remove_inode(node.inode);
         }
 
         let entry = self.do_lookup(ctx, parent, sname.as_str());
@@ -551,8 +557,8 @@ impl FileSystem for OverlayFs {
             }
 
             // delete inode from inodes and childrens
-            self.inodes.lock().unwrap().remove(&node.inode);
-            pnode.childrens.lock().unwrap().remove(sname.as_str());
+            self.remove_inode(node.inode);
+            pnode.remove_child(sname.as_str());
         }
 
         let (_entry, h, _, _) = upper.create(ctx, real_parent_inode, name, hargs)?;
@@ -909,8 +915,8 @@ impl FileSystem for OverlayFs {
             }
 
             // delete inode from inodes and childrens
-            self.inodes.lock().unwrap().remove(&node.inode);
-            pnode.childrens.lock().unwrap().remove(sname.as_str());
+            self.remove_inode(node.inode);
+            pnode.remove_child(sname.as_str());
         }
 
         // make it
@@ -979,8 +985,8 @@ impl FileSystem for OverlayFs {
             }
 
             // delete from hash
-            self.inodes.lock().unwrap().remove(&n.inode);
-            newpnode.childrens.lock().unwrap().remove(sname.as_str());
+            self.remove_inode(n.inode);
+            newpnode.remove_child(sname.as_str());
         }
 
         // create the link
@@ -1026,8 +1032,8 @@ impl FileSystem for OverlayFs {
             self.delete_whiteout_node(ctx, Arc::clone(&n))?;
 
             // delete from hash
-            self.inodes.lock().unwrap().remove(&n.inode);
-            pnode.childrens.lock().unwrap().remove(sname.as_str());
+            self.remove_inode(n.inode);
+            pnode.remove_child(sname.as_str());
         }
 
         let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;

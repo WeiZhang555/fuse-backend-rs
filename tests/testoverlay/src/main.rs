@@ -115,7 +115,7 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     SimpleLogger::new()
-        .with_level(LevelFilter::Trace)
+        .with_level(LevelFilter::Info)
         .init()
         .unwrap();
     let args = parse_args()?;
