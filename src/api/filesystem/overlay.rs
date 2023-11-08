@@ -21,6 +21,7 @@ pub trait Layer: FileSystem {
     fn root_inode(&self) -> Self::Inode;
 
     /// Create whiteout file with name <name>.
+    #[allow(clippy::unnecessary_cast)]
     fn create_whiteout(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> Result<Entry> {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = parent.into();
@@ -55,7 +56,7 @@ pub trait Layer: FileSystem {
         // Try to create whiteout char device with 0/0 device number.
         let dev = libc::makedev(0, 0);
         let mode = libc::S_IFCHR | 0o777;
-        self.mknod(ctx, ino.into(), name, mode, dev as u32, 0)
+        self.mknod(ctx, ino.into(), name, mode as u32, dev as u32, 0)
     }
 
     /// Delete whiteout file with name <name>.
