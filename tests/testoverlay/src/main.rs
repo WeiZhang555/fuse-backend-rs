@@ -29,6 +29,7 @@ pub struct Args {
     lowerdir: Vec<String>,
     upperdir: String,
     workdir: String,
+    log_level: String,
 }
 
 pub struct FuseServer {
@@ -51,12 +52,13 @@ fn new_passthroughfs_layer(rootdir: &str) -> Result<BoxedLayer> {
 
 fn help() {
     println!(
-        "Usage:\n   testoverlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint>\n"
+        "Usage:\n   testoverlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint> [-l log_level]\n"
     );
 }
 
 fn parse_args() -> Result<Args> {
     let args = env::args().collect::<Vec<String>>();
+    // We expect at least 5 arguments.
     if args.len() < 5 {
         help();
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -110,16 +112,31 @@ fn parse_args() -> Result<Args> {
         help();
         return Err(Error::from_raw_os_error(libc::EINVAL));
     }
+
+    if args.len() == 7 && args[5].as_str() == "-l" {
+        cmd_args.log_level = args[6].clone();
+    }
     Ok(cmd_args)
 }
 
+fn set_log(args: &Args) {
+    let log_level = match args.log_level.as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    SimpleLogger::new().with_level(log_level).init().unwrap();
+}
+
 fn main() -> Result<()> {
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .init()
-        .unwrap();
     let args = parse_args()?;
     println!("args: {:?}", args);
+
+    set_log(&args);
 
     // let basedir = "/home/zhangwei/program/test-overlay/test2/";
     let upper_layer = Arc::new(new_passthroughfs_layer(&args.upperdir)?);
