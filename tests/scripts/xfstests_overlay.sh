@@ -32,7 +32,7 @@ sudo cat >/usr/sbin/mount.fuse.testoverlay  <<EOF
 #!/bin/bash
 
 ulimit -n 1048576
-exec /usr/sbin/testoverlay -o \
+exec /usr/sbin/overlay -o \
     lowerdir=/tmp/testoverlay/lower2:/tmp/testoverlay/lower1,upperdir=/tmp/testoverlay/upper,workdir=/tmp/testoverlay/work \
     testoverlay /tmp/testoverlay/merged \
     1>>/tmp/testoverlay.log 2>&1 &
@@ -47,6 +47,6 @@ echo "====> Start to run xfstests."
 # run tests.
 cd /tmp/xfstests-dev
 # Some tests are not supported by fuse or cannot pass currently.
-sudo ./check -fuse -E $current_dir/xfstests.exclude
+sudo ./check -fuse -E $current_dir/xfstests_overlay.exclude
 
 

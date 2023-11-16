@@ -340,15 +340,15 @@ impl FileSystem for OverlayFs {
             None => Err(Error::from_raw_os_error(libc::ENOENT)),
             Some(handle) => {
                 let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
-                let (layer, is_upper_layer, inode) = node.first_layer_inode();
+                let (layer, in_upper_layer, inode) = node.first_layer_inode();
                 let handle_data = HandleData {
                     node: Arc::clone(&node),
                     //               childrens: None,
                     offset: 0,
                     real_handle: Some(RealHandle {
-                        layer: layer,
-                        in_upper_layer: is_upper_layer,
-                        inode: inode,
+                        layer,
+                        in_upper_layer,
+                        inode,
                         handle: AtomicU64::new(handle),
                         invalid: AtomicBool::new(false),
                     }),
@@ -838,17 +838,14 @@ impl FileSystem for OverlayFs {
 
         let (layer, _, real_inode) = node.first_layer_inode();
 
-        let result = layer.setxattr(ctx, real_inode, name, value, flags);
+        layer.setxattr(ctx, real_inode, name, value, flags)
 
-        // Check if node is directory and becomes opaque now.
-        // TODO: refresh node.
+        // TODO: refresh node since setxattr may made dir opaque.
         // let st = node.stat64(ctx)?;
         // if utils::is_dir(st) {
         //     // Setxattr may made the dir opaque, reload it if necessary.
         //     self.lookup_node(ctx, inode, "")?;
         // }
-
-        result
     }
 
     fn getxattr(
@@ -906,17 +903,15 @@ impl FileSystem for OverlayFs {
         }
 
         let (layer, _, ino) = node.first_layer_inode();
-        let result = layer.removexattr(ctx, ino, name);
+        layer.removexattr(ctx, ino, name)
 
-        // Check if node is directory.
-        // TODO: refresh the node now in case it becomes non-opaque.
+        // TODO: refresh the node since removexattr may remove the opaque xattr.
         // let st = node.stat64(ctx)?;
         // if utils::is_dir(st) {
         //     // removexattr may remove the opaque xattr so we have to reload the node itself.
         //     node.loaded.store(false, Ordering::Relaxed);
         //     self.lookup_node(ctx, inode, "")?;
         // }
-        result
     }
 
     fn fallocate(
