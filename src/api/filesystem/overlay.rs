@@ -4,11 +4,11 @@
 
 #![allow(missing_docs)]
 
-use crate::abi::fuse_abi::stat64;
 use std::ffi::{CStr, CString};
 use std::io::{Error, ErrorKind, Result};
 
 use super::{Context, Entry, FileSystem, GetxattrReply};
+use crate::abi::fuse_abi::stat64;
 
 pub const OPAQUE_XATTR_LEN: u32 = 16;
 pub const OPAQUE_XATTR: &str = "user.fuseoverlayfs.opaque";
@@ -21,30 +21,29 @@ pub trait Layer: FileSystem {
     fn root_inode(&self) -> Self::Inode;
 
     /// Create whiteout file with name <name>.
-    #[allow(clippy::unnecessary_cast)]
+    ///
+    /// If this call is successful then the lookup count of the `Inode` associated with the returned
+    /// `Entry` must be increased by 1.
     fn create_whiteout(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> Result<Entry> {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = parent.into();
         match self.lookup(ctx, ino.into(), name) {
             Ok(v) => {
-                if v.inode != 0 {
-                    // Decrease the refcount.
-                    self.forget(ctx, v.inode.into(), 1);
-                }
-
                 // Find whiteout char dev.
                 if is_whiteout(v.attr) {
                     return Ok(v);
                 }
-                // Negative entry with inode 0 indicates no entry.
+                // Non-negative entry with inode larger than 0 indicates file exists.
                 if v.inode != 0 {
+                    // Decrease the refcount.
+                    self.forget(ctx, v.inode.into(), 1);
                     // File exists with same name, create whiteout file is not allowed.
                     return Err(Error::from_raw_os_error(libc::EEXIST));
                 }
             }
             Err(e) => match e.raw_os_error() {
                 Some(raw_error) => {
-                    // We expect ENOENT or ENAMETOOLONG error.
+                    // We expect ENOENT error.
                     if raw_error != libc::ENOENT {
                         return Err(e);
                     }
@@ -56,7 +55,7 @@ pub trait Layer: FileSystem {
         // Try to create whiteout char device with 0/0 device number.
         let dev = libc::makedev(0, 0);
         let mode = libc::S_IFCHR | 0o777;
-        self.mknod(ctx, ino.into(), name, mode as u32, dev as u32, 0)
+        self.mknod(ctx, ino.into(), name, mode, dev as u32, 0)
     }
 
     /// Delete whiteout file with name <name>.
@@ -66,7 +65,7 @@ pub trait Layer: FileSystem {
         match self.lookup(ctx, ino.into(), name) {
             Ok(v) => {
                 if v.inode != 0 {
-                    // Decrease the refcount.
+                    // Decrease the refcount since we make a lookup call.
                     self.forget(ctx, v.inode.into(), 1);
                 }
 
@@ -74,7 +73,7 @@ pub trait Layer: FileSystem {
                 if is_whiteout(v.attr) {
                     return self.unlink(ctx, ino.into(), name);
                 }
-                // Negative entry with inode 0 indicates no entry.
+                //  Non-negative entry with inode larger than 0 indicates file exists.
                 if v.inode != 0 {
                     // File exists but not whiteout file.
                     return Err(Error::from_raw_os_error(libc::EINVAL));
@@ -82,7 +81,7 @@ pub trait Layer: FileSystem {
             }
             Err(e) => match e.raw_os_error() {
                 Some(raw_error) => {
-                    // ENOENT and ENAMETOOLONG are good.
+                    // ENOENT is acceptable.
                     if raw_error != libc::ENOENT {
                         return Err(e);
                     }
@@ -101,13 +100,29 @@ pub trait Layer: FileSystem {
         Ok(is_whiteout(st))
     }
 
+    /// Set the directory to opaque.
     fn set_opaque(&self, ctx: &Context, inode: Self::Inode) -> Result<()> {
+        // Use temp value to avoid moved 'parent'.
+        let ino: u64 = inode.into();
+
+        // Get attributes and check if it's directory.
+        let (st, _d) = self.getattr(ctx, ino.into(), None)?;
+        if !is_dir(st) {
+            // Only directory can be set to opaque.
+            return Err(Error::from_raw_os_error(libc::ENOTDIR));
+        }
         // A directory is made opaque by setting the xattr "trusted.overlay.opaque" to "y".
         // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
-        self.setxattr(ctx, inode, to_cstring(OPAQUE_XATTR)?.as_c_str(), b"y", 0)
+        self.setxattr(
+            ctx,
+            ino.into(),
+            to_cstring(OPAQUE_XATTR)?.as_c_str(),
+            b"y",
+            0,
+        )
     }
 
-    // Check if the directory is opaque.
+    /// Check if the directory is opaque.
     fn is_opaque(&self, ctx: &Context, inode: Self::Inode) -> Result<bool> {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = inode.into();
@@ -118,10 +133,9 @@ pub trait Layer: FileSystem {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        // Return Result<(is_opaque, break)>, if 'break' is true, stop and return the is_opaque value.
+        // Return Result<(is_opaque, break)>, if 'break' is true, stop the whole function.
         let check_attr =
             |inode: Self::Inode, attr_name: &str, attr_size: u32| -> Result<(bool, bool)> {
-                // TODO: map error?
                 let cname = CString::new(attr_name)?;
                 match self.getxattr(ctx, inode, cname.as_c_str(), attr_size) {
                     Ok(v) => {
@@ -131,18 +145,11 @@ pub trait Layer: FileSystem {
                                 return Ok((true, true));
                             }
                         }
-                        // no value found, go on to next check.
+                        // No value found, go on to next check.
                         Ok((false, false))
                     }
                     Err(e) => {
                         if let Some(raw_error) = e.raw_os_error() {
-                            // Overlay rely on getxattr, so if getxattr is not supported, we needs to error out.
-                            // if raw_error == libc::ENOTSUP
-                            //     || raw_error == libc::ENOSYS
-                            // {
-                            //     return Ok((false, true));
-                            // }
-
                             if raw_error == libc::ENODATA {
                                 return Ok((false, false));
                             }
@@ -153,22 +160,24 @@ pub trait Layer: FileSystem {
                 }
             };
 
-        // A directory is made opaque by setting the xattr "trusted.overlay.opaque" to "y".
+        // A directory is made opaque by setting some specific xattr to "y".
         // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
+
+        // Check our customized version of the xattr "user.fuseoverlayfs.opaque".
+        let (is_opaque, stop) = check_attr(ino.into(), OPAQUE_XATTR, OPAQUE_XATTR_LEN)?;
+        if stop {
+            return Ok(is_opaque);
+        }
+
+        // Also check for the unprivileged version of the xattr "trusted.overlay.opaque".
         let (is_opaque, stop) = check_attr(ino.into(), PRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)?;
         if stop {
             return Ok(is_opaque);
         }
 
-        // Also check for the unprivileged version of the xattr.
+        // Also check for the unprivileged version of the xattr "user.overlay.opaque".
         let (is_opaque, stop) =
             check_attr(ino.into(), UNPRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)?;
-        if stop {
-            return Ok(is_opaque);
-        }
-
-        // And our customized version of the xattr.
-        let (is_opaque, stop) = check_attr(ino.into(), OPAQUE_XATTR, OPAQUE_XATTR_LEN)?;
         if stop {
             return Ok(is_opaque);
         }

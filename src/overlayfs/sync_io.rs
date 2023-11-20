@@ -5,7 +5,7 @@ use super::*;
 use std::ffi::CStr;
 use std::io::Result;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,45 +131,10 @@ impl FileSystem for OverlayFs {
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
 
-        //let mut cs = Vec::new();
-        //add myself as "."
-        //let mut self_node = Arc::clone(&node);
-        // self_node.name = ".".to_string();
-        // cs.push(self_node);
-
-        // //add parent
-        // let mut parent_node = match node.parent.lock().unwrap().upgrade() {
-        //     Some(p) => p.clone(),
-        //     None => Arc::clone(self.root.as_ref().ok_or_else(|| {
-        //         error!("OPENDIR: root is none");
-        //         Error::from_raw_os_error(libc::ENOENT)
-        //     })?),
-        // };
-        // parent_node.name = "..".to_string();
-        // cs.push(parent_node);
-
-        // for (_, child) in node.childrens.lock().unwrap().iter() {
-        //     // skip whiteout node
-        //     if child.whiteout.load(Ordering::Relaxed) || child.hidden.load(Ordering::Relaxed) {
-        //         continue;
-        //     }
-        //     // *child.lookups.lock().unwrap() += 1;
-        //     cs.push(Arc::clone(child));
-        // }
-
-        // TODO: is this necessary to increase lookup count? @weizhang555
-        // for c in cs.iter() {
-        //     c.lookups.fetch_add(1, Ordering::Relaxed);
-        // }
-
-        //node.lookups.fetch_add(1, Ordering::Relaxed);
-
         self.handles.lock().unwrap().insert(
             handle,
             Arc::new(HandleData {
                 node: Arc::clone(&node),
-                //               childrens: Some(cs),
-                offset: 0,
                 real_handle: None,
             }),
         );
@@ -183,15 +148,6 @@ impl FileSystem for OverlayFs {
             info!("fuse: releasedir is not supported.");
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
-        // {
-        //     if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-        //         for child in v.node.childrens().values() {
-        //             self.forget_one(child.inode, 1);
-        //         }
-
-        //         self.forget_one(v.node.inode, 1);
-        //     }
-        // }
 
         self.handles.lock().unwrap().remove(&handle);
 
@@ -306,11 +262,6 @@ impl FileSystem for OverlayFs {
 
         flags |= libc::O_NOFOLLOW;
 
-        // FIXME: why need this? @weizhang555
-        // if cfg!(target_os = "linux") {
-        //     flags &= !libc::O_DIRECT;
-        // }
-
         if self.config.writeback {
             if flags & libc::O_ACCMODE == libc::O_WRONLY {
                 flags &= !libc::O_ACCMODE;
@@ -343,14 +294,11 @@ impl FileSystem for OverlayFs {
                 let (layer, in_upper_layer, inode) = node.first_layer_inode();
                 let handle_data = HandleData {
                     node: Arc::clone(&node),
-                    //               childrens: None,
-                    offset: 0,
                     real_handle: Some(RealHandle {
                         layer,
                         in_upper_layer,
                         inode,
                         handle: AtomicU64::new(handle),
-                        invalid: AtomicBool::new(false),
                     }),
                 };
 
@@ -543,21 +491,18 @@ impl FileSystem for OverlayFs {
 
         match data.real_handle {
             None => Err(Error::from_raw_os_error(libc::ENOENT)),
-            Some(ref hd) => {
-                hd.layer.write(
-                    ctx,
-                    hd.inode,
-                    hd.handle.load(Ordering::Relaxed),
-                    r,
-                    size,
-                    offset,
-                    lock_owner,
-                    delayed_write,
-                    flags,
-                    fuse_flags,
-                )
-                // remove whiteout node from child and inode hash
-            }
+            Some(ref hd) => hd.layer.write(
+                ctx,
+                hd.inode,
+                hd.handle.load(Ordering::Relaxed),
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                flags,
+                fuse_flags,
+            ),
         }
     }
 
@@ -634,7 +579,6 @@ impl FileSystem for OverlayFs {
 
         let mut node = self.lookup_node(ctx, inode, "")?;
 
-        //layer is upper layer
         if !node.in_upper_layer() {
             node = self.copy_node_up(ctx, Arc::clone(&node))?
         }
@@ -761,14 +705,6 @@ impl FileSystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
 
-        // readonly file can also be flushed, pass flush request
-        // to lower layer instead of return EROFS here
-        // if !self.node_in_upper_layer(Arc::clone(&node))? {
-        // in lower layer, error out or just success?
-        // FIXME:
-        //	return Err(Error::from_raw_os_error(libc::EROFS));
-        // }
-
         let (layer, real_inode, real_handle) = self.find_real_info_from_handle(handle)?;
 
         // FIXME: need to test if inode matches corresponding handle?
@@ -840,12 +776,7 @@ impl FileSystem for OverlayFs {
 
         layer.setxattr(ctx, real_inode, name, value, flags)
 
-        // TODO: refresh node since setxattr may made dir opaque.
-        // let st = node.stat64(ctx)?;
-        // if utils::is_dir(st) {
-        //     // Setxattr may made the dir opaque, reload it if necessary.
-        //     self.lookup_node(ctx, inode, "")?;
-        // }
+        // TODO: recreate node since setxattr may made dir opaque. @weizhang555.zw
     }
 
     fn getxattr(
@@ -905,13 +836,7 @@ impl FileSystem for OverlayFs {
         let (layer, _, ino) = node.first_layer_inode();
         layer.removexattr(ctx, ino, name)
 
-        // TODO: refresh the node since removexattr may remove the opaque xattr.
-        // let st = node.stat64(ctx)?;
-        // if utils::is_dir(st) {
-        //     // removexattr may remove the opaque xattr so we have to reload the node itself.
-        //     node.loaded.store(false, Ordering::Relaxed);
-        //     self.lookup_node(ctx, inode, "")?;
-        // }
+        // TODO: recreate the node since removexattr may remove the opaque xattr. @weizhang555.zw
     }
 
     fn fallocate(

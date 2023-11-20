@@ -16,8 +16,6 @@ pub struct Config {
     pub no_opendir: bool,
     pub killpriv_v2: bool,
     pub no_readdir: bool,
-    // pub xattr: bool,
-    // pub xattr_permissions: bool,
     pub perfile_dax: bool,
     pub cache_policy: CachePolicy,
     pub attr_timeout: Duration,
